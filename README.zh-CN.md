@@ -1,6 +1,8 @@
 <h1 align="center">Strata</h1>
 
-[English](README.md) · **简体中文** · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+[English](README.md) · **简体中文** · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+
+> **这是 [Niko1221/Strata](https://github.com/Niko1221/Strata) 的 fork。** 只新增一个功能：让同一个模型**跨家里局域网的两台电脑**运行（例如台式机加游戏本），每台各放一部分层。原理、用法与实测速度：**[docs/TWO_PC.md](docs/TWO_PC.md)**（英文）。以下是原版 README。
 
 <p align="center"><b>在你自己的游戏电脑上运行 1250 亿参数的 AI 模型</b><br>
 NVIDIA 或 AMD 显卡（12 GB 及以上）· Windows 或 Linux · 免费开源</p>

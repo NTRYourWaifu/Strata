@@ -896,11 +896,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers ||
+        (stage_le_ < g.n_layers) != (next_ != nullptr || remote_)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    for (int b = 0; (next_ != nullptr || remote_) && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
@@ -3474,7 +3475,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
-        if (next_ != nullptr) {
+        if (next_ != nullptr || remote_) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
@@ -3487,11 +3488,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
-            next_->hand_in_ = h;
-            next_->single_chunk_ = single_chunk;
-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
-            });
+            if (remote_) {   // the other PC reads its layers of this chunk while this one reads the next
+                next_run_ = std::async(std::launch::async, [this, h, tokens, c0, T, p0, single_chunk] {
+                    return remote_next && remote_next(h, tokens + c0, T, p0, single_chunk, next_err_);
+                });
+            } else {
+                next_->hand_in_ = h;
+                next_->single_chunk_ = single_chunk;
+                next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+                    return next_->run_impl(tokens + c0, T, p0, next_err_);
+                });
+            }
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
