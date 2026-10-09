@@ -1,8 +1,8 @@
 <h1 align="center">Strata</h1>
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · **Deutsch** · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+[English](README.upstream.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.upstream.zh-TW.md) · [日本語](README.ja.md) · **Deutsch** · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
-> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).** It adds one feature: running one model across **two PCs on a home network** (for example a desktop and a gaming laptop), each PC holding part of the layers. How it works, how to run it and measured speeds: **[docs/TWO_PC.md](docs/TWO_PC.md)**. Everything below is the original README.
+> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) that adds running one model across two PCs.** This fork's own page: [README.md](README.md) · [繁體中文](README.zh-TW.md). Below is the original Strata README.
 
 <p align="center"><b>Ein KI-Modell mit 125 Milliarden Parametern auf deinem eigenen Gaming-PC</b><br>
 NVIDIA- oder AMD-Grafikkarte (ab 12 GB) · Windows oder Linux · kostenlos und Open Source</p>

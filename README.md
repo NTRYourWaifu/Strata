@@ -1,214 +1,217 @@
-<h1 align="center">Strata</h1>
+# Strata: two PCs
 
-**English** · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+**English** · [繁體中文](README.zh-TW.md)
 
-> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).** It adds one feature: running one model across **two PCs on a home network** (for example a desktop and a gaming laptop), each PC holding part of the layers. How it works, how to run it and measured speeds: **[docs/TWO_PC.md](docs/TWO_PC.md)**. Everything below is the original README.
+> Fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT). Strata's own README (install, models, usage): [README.upstream.md](README.upstream.md).
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+This fork adds one feature to Strata: **run one model across two PCs on the same LAN**. The first PC runs the first
+K layers, the second PC runs the rest and the head. Each PC keeps its own layers' experts on its own GPU and in its own
+RAM, so two ordinary machines together can hold a model that neither can hold alone.
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+It was built for one concrete case: Qwen3.8-Flash-Next **IQ3_XXS (47 GB of RAM + VRAM)** on a desktop with 32 GB RAM
+and a gaming laptop with 16 GB RAM. On the desktop alone it runs at about **10 tokens/s** (the experts that do not fit
+are read from the SSD in small random reads). Split across the two PCs it writes at **50-62 tokens/s**.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+- [Results](#results)
+- [How it works](#how-it-works)
+- [What you need](#what-you-need)
+- [Build](#build)
+- [Run](#run)
+- [Tuning: what mattered](#tuning-what-mattered)
+- [Limits and caveats](#limits-and-caveats)
+- [Why not an existing multi-PC engine](#why-not-an-existing-multi-pc-engine)
 
-## How fast is it?
+## Results
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+Test machines:
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+| | First PC (desktop) | Second PC (laptop) |
+| --- | --- | --- |
+| GPU | RTX 3080 Ti, 12 GB | RTX 4060 Laptop, 8 GB |
+| RAM | 32 GB | 16 GB DDR5-5600, **one stick (single channel)** |
+| CPU | desktop CPU with AVX-512 | i7-14650HX (no AVX-512) |
+| Network | 1 Gbps wired, ~2 ms round trip | same |
+| OS | Windows 10 | Windows 11 |
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+Model: Qwen3.8-Flash-Next GSQ-RCO **IQ3_XXS**, split at **K = 32** (the laptop runs layers 32-47). Server path, 32K
+context, temperature 0.6, 800 tokens, English prompts. All runs with no expert reads from the SSD (see
+[Tuning](#tuning-what-mattered) for why that matters).
 
-| Size | Writes answers | Reads your prompt |
+| Task | Warm-up run | Measured run |
 | --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+| Chat | 50.0 t/s | 44.3 t/s |
+| Code 1 (INI parser) | 64.9 t/s | 61.5 t/s |
+| Code 2 (LRU cache) | 66.9 t/s | 60.5 t/s |
+| Code 3 (TS debounce) | 62.4 t/s | 50.4 t/s |
+| Long prompt, 4,132 tokens: reading | 228 t/s (18.2 s) | |
+| Long prompt: writing | 48.1 t/s | |
+| Second turn of a conversation (4,268 tokens, 4,237 reused) | 2.1 s total | |
 
-</td><td>
+How the speed got there (decode t/s, three short prompts: code / story / explain):
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+| Step | code | story | explain |
+| --- | ---: | ---: | ---: |
+| Desktop alone, no speed-ups | 10.5 | 11.1 | 10.4 |
+| Two PCs, K = 36, no speed-ups | 17.1 | 16.0 | 28.6 |
+| + MTP draft layer, RAM headroom tuned, K = 32 | 27.7-29.6 | 19.0-19.6 | 32.3-35.1 |
+| + laptop power plan "High performance" | 56.5 | 38.1 | 58.1 |
+| + adaptive expert cache on both PCs | 68.8-70.7 | 46.8-48.8 | 51.2-52.8 |
 
-</td></tr>
-</table>
+For comparison, a dense 27B model split across the same two PCs with llama.cpp RPC (+ MTP) wrote code at about
+52 t/s and chat at 28.8 t/s, and read prompts at about 400 t/s.
 
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
+**Real-world use is slower.** With a browser, an editor and a chat app open on the desktop, only about 15 GiB of RAM
+is free, about 7 GiB of experts are read from the SSD, and code runs at 40-43 t/s after warm-up.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+## How it works
+
+```
+ First PC (desktop)                               Second PC (laptop)
+ ┌──────────────────────────────┐   TCP, LAN    ┌──────────────────────────────┐
+ │ server, tokenizer            │               │ strata --net-listen PORT     │
+ │ layers 0 .. K-1              │ ── rows ────▶ │ layers K .. 47 + head        │
+ │ its experts: GPU + RAM (+SSD)│               │ its experts: GPU + RAM only  │
+ │ MTP draft layer              │ ◀── picks ─── │ sampling                     │
+ └──────────────────────────────┘  (+ last R)   └──────────────────────────────┘
+```
+
+- Strata already splits a model by layers across two GPUs in one PC (`--layer-split`). The hand-off between stages
+  is one place in the verifier: each token's row of `hc × n_embd + n_embd + hc` floats. This fork sends that row over
+  TCP instead of mapped pinned memory. The engine's math is unchanged.
+- Flash-Next's hidden size is 2560, so a token's hand-off is about **10 KB**. One verify window (4-5 tokens) is one
+  round trip. Measured network cost: about **3.5 ms per window**; it is not the bottleneck.
+- The second PC samples the tokens itself and sends back only the picks. When the first PC runs the MTP draft layer,
+  the reply also carries the last layer's residual rows (T × hc × n_embd floats, about 160 KB for T = 4).
+- These speed-ups were reconnected across the two PCs one by one, each checked against the one-PC output:
+  - **MTP draft layer**: stays on the first PC, fed by the residual rows sent back.
+  - **Conversation checkpoints**: each PC saves and restores its own layers' state, so the next turn only reads the
+    new tokens.
+  - **Batched prompt reading**: the first PC reads chunk c + 1 while the second reads chunk c.
+  - **Adaptive expert cache**: each PC adapts its own layers' cache; the second PC runs its rounds between windows.
+  - **Control vectors** (`--control-vector-scaled`): the per-request switch is forwarded to the second PC.
+- Protocol (`include/strata/core/net_stage.hpp`, version 4): messages `Hello`, `Run`, `Commit`, `Zero`, `Logits`,
+  `Bye`, `Save`, `Restore`, `Prefill`, `Cvec`, each `[u32 magic][u32 op][u64 bytes][payload]`.
+
+Code changes: `src/core/net_stage.cpp` and `include/strata/core/net_stage.hpp` (new), `src/program/generate.cpp`
+(options, per-PC loading, the second PC's message loop), `src/core/verify.cpp` / `.hpp` and `src/prefill/prefill.cpp`
+/ `.hpp` (the hand-off goes to the network when the next stage is remote), `CMakeLists.txt`.
 
 ## What you need
 
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
+- Two PCs with NVIDIA GPUs on the same LAN, **wired** if possible. Wi-Fi works but its latency jitter costs every
+  window.
+- Enough RAM + VRAM across both PCs for the model. For IQ3_XXS: about 47 GB, not counting the 27 GB lookup table
+  that stays on the SSD.
+- The same `strata` build on both PCs (the protocol version is checked at `Hello`).
+- The model files on both PCs. The second PC only reads the GGUF headers, the non-expert tensors and the expert
+  blocks of layers K and above, so it can hold a sparse copy with only those bytes.
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+## Build
 
-Experimental, written and tested by community members on their own machines:
+Build from source with CUDA. Two flags matter:
 
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
+- **`-DSTRATA_PORTABLE=ON`** if either CPU lacks AVX-512 (most laptops). A native build compiles ggml-cpu with AVX-512
+  and crashes on the other PC. Use the portable build on **both** PCs.
+- **`-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared`** with CUDA 12.x on Windows, or linking fails (LNK1169).
+- `-DCMAKE_CUDA_ARCHITECTURES="86;89"` (or your two GPUs' architectures) lets one binary run on both PCs.
 
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
-
-## Install
-
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```bat
+:: from a "x64 Native Tools" prompt (Visual Studio 2022 Build Tools), in the repository folder
+cmake -G Ninja -S . -B build-port -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF ^
+  -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared "-DCMAKE_CUDA_ARCHITECTURES=86;89" ^
+  "-DSTRATA_GGML_DIR=<path to llama.cpp, as set up by setup.py>"
+cmake --build build-port --target strata -j 8
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+Copy `build-port\strata.exe` (and the CUDA runtime DLLs it needs) to the second PC.
 
-### Or do it yourself
+## Run
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+Both PCs get the same engine options as a normal one-PC run (pack, model, `--expert-profile`, `--resident-experts`,
+`--spec`, ...), plus:
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
-
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
-
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
-
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
-
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-## Which model should I pick?
-
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
-
-| Your RAM | Take | Why |
+| Option | Where | Meaning |
 | --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+| `--net-listen PORT` | second PC | wait for the first PC on PORT (all interfaces) |
+| `--net-split K` | both | the second PC's first layer (the same K on both) |
+| `--net-connect HOST:PORT` | first PC | connect to the second PC |
 
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
+Requirements checked at start: `--resident-experts` and `--expert-profile` are needed; `--layer-split` (two GPUs in
+one PC) cannot be combined with the network split.
 
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
+1. **Second PC first.** Start `strata.exe <options> --net-listen 47700 --net-split 32`. It loads its layers and prints
+   `NETREADY` when it is ready to accept the first PC.
+2. **First PC.** Start the server as usual with `--net-connect <second PC IP>:47700 --net-split 32` added to the
+   engine `args` of the server config (`python -m serve.server --engine strata --config <config.json>`).
+3. When the first PC disconnects, the second PC waits for the next connection, so it can stay running between
+   sessions. Stop it when you need its GPU back.
 
-## Using it
+Useful environment variables:
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+| Variable | Use |
+| --- | --- |
+| `STRATA_RESIDENT_HEADROOM_GIB` | RAM left free on that PC. We use 3 on the desktop and 1 on the laptop. |
+| `STRATA_WATCHDOG_S` | stall watchdog in seconds; raise it if the second PC's SSD can stall (we use 120-600) |
+| `STRATA_NET_TRACE=1` | log every network message |
+| `STRATA_NET_EXACT=1` | test mode: with a fixed `--expert-cache N`, each PC holds exactly the experts a one-PC cache of N slots would hold for its layers, so greedy output can be compared token for token |
 
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
+Our best settings (K = 32):
 
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
+- First PC: `--spec 4 --spec-min-p 0.5 --mtp <mtp dir> --prefill 2048 --pcie-frac 0 --suffix-draft 0 --expert-cache auto --vram-reserve-mib 700`, `STRATA_RESIDENT_HEADROOM_GIB=3`.
+- Second PC: `--spec 4 --vram-reserve-mib 300`, `STRATA_RESIDENT_HEADROOM_GIB=1`.
 
-## Something went wrong?
+## Tuning: what mattered
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+In order of how much speed each one cost or gave:
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+1. **The laptop's Windows power plan.** "Balanced" throttles the CPU that computes the RAM-resident experts: the
+   laptop's part of a window took 78 ms. "High performance" brought it to 24 ms and **doubled the total speed**
+   (27.7 → 56.5 t/s). Check with `powercfg /getactivescheme`.
+2. **Never let experts spill to the SSD.** When 1-4 GiB of the desktop's experts did not fit in RAM, speed dropped
+   20-50% (56-59 → 29-44 t/s). Other programs on the PC are the usual cause. Compare speeds only between runs with
+   the same free RAM.
+3. **Where to split (K).** Give the second PC exactly as many layers as fit in its VRAM + RAM with no SSD reads, and
+   the rest to the PC with more RAM. K = 36 → 32 moved the desktop from about 36 GB of SSD reads per prompt to none.
+4. **MTP helps only once nothing spills.** Checking 4-5 drafted tokens needs 4-5 times the experts. With experts on the
+   SSD, MTP gave almost nothing; with everything in RAM it is a large gain.
+5. **Prompt chunk size.** `--prefill 2048` read a 4.5K-token prompt at 448 t/s, versus 344 at 8192 (one chunk, so no
+   overlap between the two PCs) and 364 at 1024.
+6. **Do not force more CPU threads.** Strata uses one worker per physical core. Forcing more (`--pool-workers`) was
+   slower on both PCs: the expert math is bound by memory bandwidth.
+7. **Laptop housekeeping.** Remove heavy background software, use a fixed page file. On our laptop this raised the
+   commit limit from 18.7 GB to 31.7 GB, which Strata needs to pin its experts in RAM.
 
-## How does it work?
+Tried and not worth it: `--spec 3` or `5` (4 is best), PCIe split for missed experts (no change), suffix drafting
+(helps only on edits that repeat earlier text).
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+## Limits and caveats
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+- **No authentication.** `--net-listen` accepts any connection on the port. Use it only on a home LAN and limit the
+  firewall rule to the local subnet.
+- **Two PCs, one GPU each.** No more than two stages; not combined with `--layer-split` or helper GPUs.
+- **Off in two-PC mode:** conversation parking (`conversation_cache_mib`), batching several requests (`parallel`).
+  `window_logprobs` is not available.
+- **Different GPU generations do not round identically.** On the same GPU model the split output is token-for-token
+  identical to one PC (checked on prompts up to 4,461 tokens). Between an RTX 3080 Ti (Ampere) and an RTX 4060 (Ada),
+  greedy output can pick a different word after some dozens of tokens; the text stays coherent. This is the hardware,
+  not the network code.
+- **First prompt reading is slower than one PC.** About 230-255 t/s at 32K context on our machines. Later turns reuse
+  the checkpoints and only read the new tokens.
+- Tested on Windows only. The socket code has a BSD-sockets path for Linux, untested.
+- Based on Strata commit `d5ea713` (0.1.40.3). Upstream has moved on since; this branch has not been rebased.
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
+## Why not an existing multi-PC engine
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+Checked on 2026-10-08, from each project's own documentation:
 
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
+| Project | Why it did not fit |
+| --- | --- |
+| prima.cpp | no Windows; no MoE models of this architecture |
+| exo | Windows + CUDA listed as long-term |
+| distributed-llama | CPU / Vulkan only; up to Qwen3 30B-A3B |
+| Parallax | weights must fit in VRAM (20 GB across our two PCs); WSL2 |
+| llama.cpp RPC | runs the model, but on one PC with everything in RAM llama.cpp writes 9-16 t/s where Strata writes 42-58; across two PCs it can only be slower (we measured 6 t/s on the Coder model) |
+| Strata upstream | the author does not plan to split across machines (issue #1256) |
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
-
-## Credits and license
-
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
-
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+Tensor parallelism across PCs (both PCs computing every layer) was also measured with llama.cpp RPC `-sm tensor` on
+wired gigabit: 0.6-0.7 t/s. Layer splitting is the only practical option without RDMA networking.

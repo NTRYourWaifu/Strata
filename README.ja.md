@@ -1,8 +1,8 @@
 <h1 align="center">Strata</h1>
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md) · **日本語** · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+[English](README.upstream.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.upstream.zh-TW.md) · **日本語** · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
-> **これは [Niko1221/Strata](https://github.com/Niko1221/Strata) のフォークです。** 追加した機能は一つだけ：一つのモデルを**家庭内 LAN の 2 台の PC**（例：デスクトップとゲーミングノート）にまたがって動かし、各 PC がレイヤーの一部を担当します。仕組み・使い方・実測速度：**[docs/TWO_PC.md](docs/TWO_PC.md)**（英語）。以下はオリジナルの README です。
+> **これは [Niko1221/Strata](https://github.com/Niko1221/Strata) のフォークで、「2 台の PC で 1 つのモデルを動かす」機能を追加しています。** フォークの説明は [トップの README](README.md)（英語）。以下はオリジナルの Strata の README です。
 
 <p align="center"><b>1,250 億パラメータの AI モデルを、手元のゲーミング PC で動かす</b><br>
 NVIDIA または AMD のグラフィックカード（12 GB 以上） · Windows または Linux · 無料のオープンソース</p>
