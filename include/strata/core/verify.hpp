@@ -41,6 +41,7 @@ namespace strata::core {
 
 class NativeHead;
 class RemoteExpertOpt;
+class NetLink;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -84,7 +85,7 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
-    int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    int64_t vocab() const;
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -124,6 +125,9 @@ public:
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// What a window across two PCs sends along (--pipeline-windows: NetPipe sends the window, not `run`).
+    const strata::kernels::SamplerParams& sampling() const { return sampling_; }
+    bool head_sampling() const { return head_sampling_; }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -138,6 +142,13 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// A LAYER SPLIT ACROSS TWO PCs (net_stage.hpp): the next stage runs on the other PC.  `hand_out_host` is the host
+    /// view of `handoff_out` (mapped pinned memory): after this stage's window it holds the rows the link sends.  The
+    /// sampling settings, the penalty history and the drafter's q rows stay here and go along with every window.
+    /// `R_rows`: where the link puts each window's final residual rows (device; the draft layer reads them), or null.
+    void set_link(NetLink* link, const float* hand_out_host, float* R_rows = nullptr) {
+        link_ = link; link_hand_ = hand_out_host; link_R_ = R_rows;
+    }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -251,7 +262,7 @@ public:
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
-    const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    const float* final_R_all() const { return next_ ? next_->final_R_all() : link_ ? link_R_ : R_; }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -368,6 +379,9 @@ private:
     float* hand_out_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    NetLink* link_ = nullptr;
+    const float* link_hand_ = nullptr;
+    float* link_R_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;

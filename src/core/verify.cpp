@@ -1,6 +1,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/net_stage.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -10,6 +11,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/keep_warm.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -740,7 +742,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     return true;
 }
 
-const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+int64_t Verifier::vocab() const { return next_ ? next_->vocab() : link_ ? link_->vocab() : n_vocab_; }
+
+const float* Verifier::final_R(int t) const {
+    return (link_ ? link_R_ : R_) + (size_t) t * (size_t) (g_->hc * g_->n_embd);
+}
 
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
@@ -1973,6 +1979,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                    std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
+    keep_warm_poke(device_);   // a GTX 16xx stage idles to P3 between windows (keep_warm.hpp)
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -2134,6 +2141,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        if (link_ != nullptr) {   // the next stage is on the other PC: the rows go over the network
+            const int32_t* q = spec_q_;
+            const int nq = spec_nq_;
+            spec_q_ = nullptr;
+            spec_nq_ = 0;
+            return link_->run(T, tokens, pos0, link_hand_, (int) Verifier::handoff_floats(g), sampling_, head_sampling_,
+                              hist_d_, hist_len_, q, nq, (int) strata::core::kSpecQStride, out, err);
+        }
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -2267,6 +2282,7 @@ void Verifier::publish_plan(void* ctx) {
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                                std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
+    if (link_ != nullptr) { err = "window_logprobs: not across two PCs (the head is on the other one)"; return false; }
     const OnDevice on_device(device_);
     if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
         err = "window_logprobs: no head logits for this window";
@@ -2355,6 +2371,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
             ss_->ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
+    if (link_ != nullptr) return link_->commit(n_keep, err);
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
@@ -2673,6 +2690,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
                              void* user, int32_t* out, std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
+    keep_warm_poke(device_);   // a GTX 16xx stage idles to P3 between windows (keep_warm.hpp)
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
@@ -2834,6 +2852,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     const OnDevice on_device(device_);
+    keep_warm_poke(device_);   // a GTX 16xx stage idles to P3 between windows (keep_warm.hpp)
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
@@ -2931,6 +2950,10 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
 
 bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
+    if (link_ != nullptr) {
+        std::string e;
+        return link_->logits(t, host, e);
+    }
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
@@ -3016,6 +3039,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
+    keep_warm_poke(device_);   // a GTX 16xx stage idles to P3 between windows (keep_warm.hpp)
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }

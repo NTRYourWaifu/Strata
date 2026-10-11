@@ -161,6 +161,19 @@ public:
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
 
+    /// TWO PCs (net): this stage runs layers [layer_begin, layer_end) and the later ones are on the other PC: each
+    /// chunk's rows (host, T x hc*n_embd) go to `remote_next` on a thread, as a local next stage's run would - so this
+    /// PC reads chunk c + 1 while the other reads chunk c.  `on_chunk` is then the caller's to call (from
+    /// `remote_next`, with the rows the other PC sends back).  Set before `init`.
+    void set_stage_remote(int64_t layer_begin, int64_t layer_end) {
+        stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = nullptr; remote_ = true;
+    }
+    std::function<bool(const float* rows, const int64_t* tokens, int64_t T, int64_t pos0, bool single_chunk,
+                       std::string& err)> remote_next;
+    /// TWO PCs (net): the next `run` reads the previous PC's rows (host, T x hc*n_embd, valid until it returns)
+    /// instead of embedding the tokens.
+    void set_hand_in(const float* rows, bool single_chunk) { hand_in_ = rows; single_chunk_ = single_chunk; }
+
     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's
     /// non-resident experts over its own PCIe link into its own (lent) prompt buffers, computes their rows, and sends
@@ -197,6 +210,7 @@ private:
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    bool remote_ = false;               ///< set_stage_remote: the next stage is on the other PC
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
