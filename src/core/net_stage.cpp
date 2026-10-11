@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -58,6 +59,22 @@ void tune(sock_t s) {
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*) &big, sizeof big);
 }
 }  // namespace
+
+void net_to_bf16(const float* in, uint16_t* out, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u;
+        std::memcpy(&u, in + i, 4);
+        u += 0x7FFFu + ((u >> 16) & 1u);   // round to nearest even (the rows carry no NaN)
+        out[i] = (uint16_t) (u >> 16);
+    }
+}
+
+void net_from_bf16(const uint16_t* in, float* out, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t u = (uint32_t) in[i] << 16;
+        std::memcpy(out + i, &u, 4);
+    }
+}
 
 NetConn::~NetConn() { close(); }
 
@@ -202,6 +219,7 @@ bool NetLink::reply(std::string& err, std::vector<uint8_t>* payload) {
 }
 
 bool NetLink::connect(const std::string& host_port, const NetHello& h, std::string& err) {
+    if (const char* v = std::getenv("STRATA_NET_HALF")) half = v[0] == '1';
     if (!c_.connect_to(host_port, err)) return false;
     if (!c_.send_msg(NetOp::Hello, &h, sizeof h)) { err = "net stage: send failed"; return false; }
     std::vector<uint8_t> p;
@@ -223,7 +241,7 @@ bool NetLink::run(int T, const int32_t* tokens, int64_t pos0, const float* hand,
     h.hist_len = hist_dev != nullptr ? hist_len : 0;
     h.nq = q != nullptr ? nq : 0;
     h.q_stride = q_stride;
-    h.want_R = R_dev != nullptr ? 1 : 0;
+    h.want_R = (R_dev != nullptr || R_host != nullptr ? 1 : 0) | (half ? NetRowsBf16 : 0);
     if (h.hist_len > 0) {   // the penalty rows live on this PC's GPU: the window's T rows go along
         hist_h_.resize((size_t) T * (size_t) hist_len);
         if (cudaMemcpy(hist_h_.data(), hist_dev, hist_h_.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -231,24 +249,44 @@ bool NetLink::run(int T, const int32_t* tokens, int64_t pos0, const float* hand,
             return false;
         }
     }
-    const size_t nh = (size_t) T * (size_t) handoff_floats * sizeof(float);
+    const size_t nf = (size_t) T * (size_t) handoff_floats;
+    const void* hp = hand;
+    if (half) {
+        half_out_.resize(nf);
+        net_to_bf16(hand, half_out_.data(), nf);
+        hp = half_out_.data();
+    }
+    const size_t nh = nf * (half ? 2 : sizeof(float));
     if (!c_.send_msg(NetOp::Run, &h, sizeof h, tokens, (size_t) T * 4, hist_h_.data(), (size_t) h.hist_len * T * 4, q,
-                     (size_t) h.nq * (size_t) q_stride * 4, hand, nh)) {
+                     (size_t) h.nq * (size_t) q_stride * 4, hp, nh)) {
         err = "net stage: send failed";
         return false;
     }
     bytes_sent += sizeof h + (size_t) T * 4 + nh;
     std::vector<uint8_t> p;
     if (!reply(err, &p)) return false;
-    const size_t nR = h.want_R ? (size_t) T * (size_t) R_floats * sizeof(float) : 0;
-    if (p.size() < (size_t) T * 4 + nR) { err = "net stage: a short window reply"; return false; }
+    const size_t nRf = (h.want_R & 1) ? (size_t) T * (size_t) R_floats : 0;
+    const size_t nR = nRf * sizeof(float);
+    if (p.size() < (size_t) T * 4 + nRf * (half ? 2 : 4)) { err = "net stage: a short window reply"; return false; }
     std::memcpy(out, p.data(), (size_t) T * 4);
-    if (nR > 0) {
+    if (nR > 0 && R_host != nullptr) {   // NetPipe's thread: host memory only, no CUDA call (see NetPipe)
         const auto tc = std::chrono::steady_clock::now();
+        const uint8_t* src = p.data() + (size_t) T * 4;
+        if (half) net_from_bf16((const uint16_t*) src, R_host, nRf);
+        else std::memcpy(R_host, src, nR);
+        ms_rcopy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+    } else if (nR > 0) {
+        const auto tc = std::chrono::steady_clock::now();
+        const void* src = p.data() + (size_t) T * 4;
+        if (half) {
+            half_in_.resize(nRf);
+            net_from_bf16((const uint16_t*) src, half_in_.data(), nRf);
+            src = half_in_.data();
+        }
         cudaStream_t rs = (cudaStream_t) R_stream;
         const bool ok = rs == nullptr
-                            ? cudaMemcpy(R_dev, p.data() + (size_t) T * 4, nR, cudaMemcpyHostToDevice) == cudaSuccess
-                            : cudaMemcpyAsync(R_dev, p.data() + (size_t) T * 4, nR, cudaMemcpyHostToDevice, rs) == cudaSuccess &&
+                            ? cudaMemcpy(R_dev, src, nR, cudaMemcpyHostToDevice) == cudaSuccess
+                            : cudaMemcpyAsync(R_dev, src, nR, cudaMemcpyHostToDevice, rs) == cudaSuccess &&
                                   cudaStreamSynchronize(rs) == cudaSuccess;
         if (!ok) {
             err = "net stage: the final residual rows copy failed";
@@ -290,11 +328,20 @@ bool NetLink::cvec(bool on, std::string& err) {
     return reply(err);
 }
 
-bool NetLink::prefill(const NetPrefillHead& h, const int32_t* tokens, const float* rows, int64_t row_floats,
+bool NetLink::prefill(const NetPrefillHead& h0, const int32_t* tokens, const float* rows, int64_t row_floats,
                       std::vector<float>* back, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
-    const size_t nr = (size_t) h.T * (size_t) row_floats * sizeof(float);
-    if (!c_.send_msg(NetOp::Prefill, &h, sizeof h, tokens, (size_t) h.T * 4, rows, nr)) {
+    NetPrefillHead h = h0;
+    if (half) h.want_R |= NetRowsBf16;
+    const size_t nf = (size_t) h.T * (size_t) row_floats;
+    const void* rp = rows;
+    if (half) {
+        half_out_.resize(nf);
+        net_to_bf16(rows, half_out_.data(), nf);
+        rp = half_out_.data();
+    }
+    const size_t nr = nf * (half ? 2 : sizeof(float));
+    if (!c_.send_msg(NetOp::Prefill, &h, sizeof h, tokens, (size_t) h.T * 4, rp, nr)) {
         err = "net stage: send failed";
         return false;
     }
@@ -303,8 +350,9 @@ bool NetLink::prefill(const NetPrefillHead& h, const int32_t* tokens, const floa
     if (!reply(err, back != nullptr ? &p : nullptr)) return false;
     if (back != nullptr) {
         if (p.size() < nr) { err = "net stage: a short prompt chunk reply"; return false; }
-        back->resize((size_t) h.T * (size_t) row_floats);
-        std::memcpy(back->data(), p.data(), nr);
+        back->resize(nf);
+        if (half) net_from_bf16((const uint16_t*) p.data(), back->data(), nf);
+        else std::memcpy(back->data(), p.data(), nr);
     }
     ms_prefill += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     ++prefill_chunks;
@@ -326,16 +374,19 @@ NetPipe::~NetPipe() {
 bool NetPipe::start(NetLink* link, int device, std::string& err) {
     link_ = link;
     dev_ = device;
-    R[0] = link->R_dev;
     if (cudaSetDevice(device) != cudaSuccess) { err = "net pipe: cudaSetDevice failed"; return false; }
-    cudaStream_t s = nullptr;
+    cudaStream_t s = nullptr;   // the serial loop's row copies (the decode loop's own thread) stay off the busy streams
     if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) { err = "net pipe: stream creation failed"; return false; }
     stream_ = s;
-    if (R[0] != nullptr) {
-        const size_t rb = (size_t) 8 * (size_t) link->R_floats * sizeof(float);   // kVerifyMaxT rows
-        if (cudaMalloc((void**) &R[1], rb) != cudaSuccess) { err = "net pipe: the odd windows' residual rows do not fit"; return false; }
-    }
     link->R_stream = stream_;
+    if (link->R_dev != nullptr) {   // the drafter wants the rows: two page-locked host buffers, one per parity
+        const size_t rb = (size_t) 8 * (size_t) link->R_floats * sizeof(float);   // kVerifyMaxT rows
+        for (float*& r : R)
+            if (cudaHostAlloc((void**) &r, rb, cudaHostAllocPortable) != cudaSuccess) {
+                err = "net pipe: the residual rows' page-locked buffers";
+                return false;
+            }
+    }
     return true;
 }
 
@@ -350,11 +401,10 @@ void NetPipe::launch(int par, int T, const int32_t* tokens, int64_t pos0, const 
     err_.clear();
     float* rd = R[par & 1];
     th_ = std::thread([this, pos0, handoff_floats, sp, head_sampling, rd] {
-        cudaSetDevice(dev_);
-        link_->R_dev = rd;
+        link_->R_host = rd;   // no CUDA call on this thread (see the class comment)
         ok_ = link_->run(T_, tok_.data(), pos0, hand_.data(), handoff_floats, sp, head_sampling, nullptr, 0, nullptr, 0,
                          0, out_, err_);
-        link_->R_dev = R[0];
+        link_->R_host = nullptr;
         done_.store(true, std::memory_order_release);
     });
 }

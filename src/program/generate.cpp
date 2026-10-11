@@ -2281,7 +2281,11 @@ int main(int argc, char** argv) {
                      net_first ? ("the rest on " + o.net_connect).c_str() : "the first layers on the other PC",
                      net_second ? "; the draft layer runs on the first PC" : "");
         if (net_second) o.mtp.clear();   // the draft layer runs on the first PC, from the residual rows sent back
-        if (net_second) o.adapt_async = 0;   // its rounds run between the first PC's windows (the blocking tier)
+        // the second PC's adaptive rounds: the blocking tier between the first PC's windows by default; --adapt-async 1
+        // with STRATA_NET_ADAPT_ASYNC=1 there (H-48, 10-12, opt-in while it is measured) runs the asynchronous tier's
+        // steps at its message boundaries instead (no window is in
+        // flight on this PC between messages: the serial loop's rule), so a round no longer holds up the next window
+        if (net_second && std::getenv("STRATA_NET_ADAPT_ASYNC") == nullptr) o.adapt_async = 0;
         o.conversation_cache_mib = 0;   // checkpoints stay (each PC keeps its own layers' part); no parking
         o.batch = 0;
         // --pipeline-windows 2 (H-42): the first PC runs the next window on a guess while the second verifies this one
@@ -7591,6 +7595,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: split across two PCs: %s\n", err.c_str());
                     return 1;
                 }
+                if (net_link->half)
+                    std::fprintf(stderr, "strata serve: split across two PCs: the rows travel as bf16 (STRATA_NET_HALF=1)\n");
                 float* net_R_d = nullptr;   // the draft layer's rows: the last layer's residuals, sent back
                 const strata::core::OnDevice on_net(net_dev);   // the drafter's device (a local split: the last stage's)
                 if (!o.mtp.empty()) {
@@ -9193,6 +9199,7 @@ int main(int argc, char** argv) {
                 int64_t pf_p0 = 0, net_pf_n = 0, net_pf_tokens = 0;
                 double net_pf_ms = 0;
                 std::vector<float> pf_back;   // a prompt chunk's last-layer rows, for the first PC's draft layer
+                std::vector<float> pf_in;     // a bf16 chunk's rows (NetRowsBf16) back as floats for the prompt path
                 sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
                     if (pf_back.empty()) return true;
                     const size_t D = (size_t) (g.hc * g.n_embd);
@@ -9204,6 +9211,8 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 int64_t net_run_n = 0;
+                double net_t_wait = ver.ms_wait, net_t_pool = ver.ms_pool, net_t_run = drive.d.ms_run;   // at the last Zero
+                int64_t net_t_miss = drive.d.multi_misses, net_t_ent = drive.d.multi_entries, net_t_hits = drive.d.cache_hits;
                 while (!bye) {
                     strata::core::NetOp op{};
                     std::string e;
@@ -9253,10 +9262,15 @@ int main(int argc, char** argv) {
                     case strata::core::NetOp::Run: {
                         strata::core::NetRunHead h;
                         if (msg.size() < sizeof h) { strata::core::net_reply_err(nc, "a short window"); break; }
-                        net_adapt_land(false);
+                        if (ajob) {   // --adapt-async: one tick per window, the serial loop's (nothing in flight here now)
+                            if (!adapt_tick(false)) std::fprintf(stderr, "strata serve: second PC: an adaptive step failed\n");
+                        } else {
+                            net_adapt_land(false);
+                        }
                         std::memcpy(&h, msg.data(), sizeof h);
+                        const bool hb16 = (h.want_R & strata::core::NetRowsBf16) != 0;   // STRATA_NET_HALF on the first PC
                         const size_t need = sizeof h + (size_t) h.T * 4 + (size_t) h.hist_len * h.T * 4 +
-                                            (size_t) h.nq * h.q_stride * 4 + (size_t) h.T * HB * 4;
+                                            (size_t) h.nq * h.q_stride * 4 + (size_t) h.T * HB * (hb16 ? 2 : 4);
                         if (h.T < 1 || h.T > strata::kernels::kVerifyMaxT || msg.size() != need ||
                             h.hist_len < 0 || h.hist_len > kNetHistCap) {
                             strata::core::net_reply_err(nc, "a malformed window");
@@ -9274,7 +9288,8 @@ int main(int argc, char** argv) {
                         r += (size_t) h.hist_len * h.T * 4;
                         const int32_t* q = (const int32_t*) r;
                         r += (size_t) h.nq * h.q_stride * 4;
-                        std::memcpy(net_hand_h, r, (size_t) h.T * HB * 4);
+                        if (hb16) strata::core::net_from_bf16((const uint16_t*) r, net_hand_h, (size_t) h.T * HB);
+                        else std::memcpy(net_hand_h, r, (size_t) h.T * HB * 4);
                         ver.set_sampling(h.sp);
                         ver.set_head_sampling(h.head_sampling != 0);
                         if (h.hist_len > 0) {
@@ -9304,7 +9319,7 @@ int main(int argc, char** argv) {
                             strata::core::net_reply_err(nc, e);
                             break;
                         }
-                        if (h.want_R != 0) {   // the first PC's draft layer: this window's final residual rows too
+                        if ((h.want_R & 1) != 0) {   // the first PC's draft layer: this window's final residual rows too
                             const size_t nR = (size_t) h.T * (size_t) (g.hc * g.n_embd);
                             reply_buf.resize((size_t) h.T + nR);
                             std::memcpy(reply_buf.data(), outw.data(), (size_t) h.T * 4);
@@ -9312,11 +9327,18 @@ int main(int argc, char** argv) {
                                 strata::core::net_reply_err(nc, "the final residual rows copy failed");
                                 break;
                             }
-                            strata::core::net_reply_ok(nc, reply_buf.data(), reply_buf.size() * 4);
+                            if (hb16) {   // the rows as bf16 after the picks: half the reply
+                                strata::core::net_to_bf16((const float*) (reply_buf.data() + h.T), (uint16_t*) (reply_buf.data() + h.T), nR);
+                                strata::core::net_reply_ok(nc, reply_buf.data(), (size_t) h.T * 4 + nR * 2);
+                            } else {
+                                strata::core::net_reply_ok(nc, reply_buf.data(), reply_buf.size() * 4);
+                            }
                         } else {
                             strata::core::net_reply_ok(nc, outw.data(), (size_t) h.T * 4);
                         }
-                        if (!net_commit_flags) {
+                        if (ajob) {
+                            // --adapt-async: the rounds start and move on in adapt_tick (above, and at idle commits)
+                        } else if (!net_commit_flags) {
                             if (!net_adapt_round())
                                 std::fprintf(stderr, "strata serve: second PC: an adaptive round failed\n");
                         } else if (!drive.d.usage.empty() && o.adapt_every > 0 && ++net_rounds % o.adapt_every == 0) {
@@ -9329,7 +9351,9 @@ int main(int argc, char** argv) {
                         if (msg.size() >= 4) std::memcpy(&n, msg.data(), 4);
                         if (msg.size() >= 8) { std::memcpy(&fl, msg.data() + 4, 4); net_commit_flags = true; }
                         if (!ver.commit(n, e)) pending = e;
-                        if (fl >= 0 && (fl & strata::core::NetCommitIdle) != 0 && net_adapt_due) {
+                        if (ajob) {   // --adapt-async: a step at every commit too (not counted as a window)
+                            if (!adapt_tick(false, false)) std::fprintf(stderr, "strata serve: second PC: an adaptive step failed\n");
+                        } else if (fl >= 0 && (fl & strata::core::NetCommitIdle) != 0 && net_adapt_due) {
                             net_adapt_due = false;
                             if (!adapt()) std::fprintf(stderr, "strata serve: second PC: an adaptive round failed\n");
                         }
@@ -9341,10 +9365,30 @@ int main(int argc, char** argv) {
                                                  "%.0f ms in commits; %lld prompt chunks (%lld tokens) in %.0f ms\n",
                                          (long long) net_run_n, net_run_ms, net_run_n > 0 ? net_run_ms / (double) net_run_n : 0.0,
                                          net_commit_ms, (long long) net_pf_n, (long long) net_pf_tokens, net_pf_ms);
+                            // H-48: where this PC's window goes (STRATA_DECODE_TIMING=1; + STRATA_VERIFY_PROFILE=1 for the
+                            // GPU stages), the first PC's "decode timing" line for the second PC's layers
+                            static const bool net_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+                            if (net_timing && net_run_n > 0) {
+                                const double w = (double) net_run_n, L = (double) (g.n_layers - o.net_split);
+                                std::fprintf(stderr, "strata serve: second PC timing: %lld windows, %.2f ms/window running = GPU-reach "
+                                                     "wait %.2f + per-layer host %.2f [CPU %.2f]; per layer-window: CPU experts %.2f "
+                                                     "(%.2f entries), VRAM hits %.2f\n",
+                                             (long long) net_run_n, net_run_ms / w, (ver.ms_wait - net_t_wait) / w,
+                                             (ver.ms_pool - net_t_pool) / w, (drive.d.ms_run - net_t_run) / w,
+                                             (double) (drive.d.multi_misses - net_t_miss) / (w * L),
+                                             (double) (drive.d.multi_entries - net_t_ent) / (w * L),
+                                             (double) (drive.d.cache_hits - net_t_hits) / (w * L));
+                                const std::string pr = ver.profile_report();
+                                if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages, second PC (ms/window):%s\n", pr.c_str());
+                            }
                             net_run_ms = net_commit_ms = net_pf_ms = 0;
                             net_run_n = net_pf_n = net_pf_tokens = 0;
                         }
+                        net_t_wait = ver.ms_wait; net_t_pool = ver.ms_pool; net_t_run = drive.d.ms_run;
+                        net_t_miss = drive.d.multi_misses; net_t_ent = drive.d.multi_entries; net_t_hits = drive.d.cache_hits;
                         if (!ver.wait_commit(e)) { strata::core::net_reply_err(nc, e); break; }
+                        if (ajob && !adapt_tick(true))   // --adapt-async: a request starts with the round drained
+                            std::fprintf(stderr, "strata serve: second PC: an adaptive step failed\n");
                         strata::core::session_zero(ss, g, nullptr, main_cs);
                         cudaStreamSynchronize(main_stream);
                         pending.clear();
@@ -9380,13 +9424,16 @@ int main(int argc, char** argv) {
                         if (msg.size() < sizeof h) { strata::core::net_reply_err(nc, "a short prompt chunk"); break; }
                         std::memcpy(&h, msg.data(), sizeof h);
                         const size_t D = (size_t) (g.hc * g.n_embd);
-                        if (h.T <= 0 || msg.size() < sizeof h + (size_t) h.T * 4 + (size_t) h.T * D * 4) {
+                        const bool pb16 = (h.want_R & strata::core::NetRowsBf16) != 0;
+                        if (h.T <= 0 || msg.size() < sizeof h + (size_t) h.T * 4 + (size_t) h.T * D * (pb16 ? 2 : 4)) {
                             strata::core::net_reply_err(nc, "a short prompt chunk");
                             break;
                         }
                         if (!pending.empty()) { strata::core::net_reply_err(nc, pending); pending.clear(); break; }
                         if (!ver.wait_commit(e)) { strata::core::net_reply_err(nc, e); break; }
                         net_adapt_land(true);   // the swaps in flight land before the prompt path lends any slot
+                        if (ajob && !adapt_tick(true))   // --adapt-async: the same, the round in flight drained
+                            std::fprintf(stderr, "strata serve: second PC: an adaptive step failed\n");
                         if (!net_lend(h.T, e)) { strata::core::net_reply_err(nc, "lending the prompt path its slots: " + e); break; }
                         std::vector<int64_t> t64((size_t) h.T);
                         const int32_t* t32 = (const int32_t*) (msg.data() + sizeof h);
@@ -9394,13 +9441,24 @@ int main(int argc, char** argv) {
                         ss.ple_prev[0] = h.ple_prev[0];
                         ss.ple_prev[1] = h.ple_prev[1];
                         pf_p0 = h.pos0;
-                        pf_back.assign(h.want_R != 0 ? (size_t) h.T * D : 0, 0.0f);
-                        sp.set_hand_in((const float*) (msg.data() + sizeof h + (size_t) h.T * 4), h.single_chunk != 0);
+                        pf_back.assign((h.want_R & 1) != 0 ? (size_t) h.T * D : 0, 0.0f);
+                        const uint8_t* pf_rows = msg.data() + sizeof h + (size_t) h.T * 4;
+                        if (pb16) {
+                            pf_in.resize((size_t) h.T * D);
+                            strata::core::net_from_bf16((const uint16_t*) pf_rows, pf_in.data(), pf_in.size());
+                            pf_rows = (const uint8_t*) pf_in.data();
+                        }
+                        sp.set_hand_in((const float*) pf_rows, h.single_chunk != 0);
                         if (!sp.run(t64.data(), h.T, h.pos0, e)) {
                             strata::core::net_reply_err(nc, "the prompt chunk: " + e);
                             break;
                         }
-                        strata::core::net_reply_ok(nc, pf_back.data(), pf_back.size() * sizeof(float));
+                        if (pb16 && !pf_back.empty()) {   // in place: each bf16 lands below the float it came from
+                            strata::core::net_to_bf16(pf_back.data(), (uint16_t*) pf_back.data(), pf_back.size());
+                            strata::core::net_reply_ok(nc, pf_back.data(), pf_back.size() * 2);
+                        } else {
+                            strata::core::net_reply_ok(nc, pf_back.data(), pf_back.size() * sizeof(float));
+                        }
                         ++net_pf_n;
                         net_pf_tokens += h.T;
                         break;
@@ -9466,6 +9524,7 @@ int main(int argc, char** argv) {
                     if (net_trace) std::fprintf(stderr, "net: %.3f done\n", (double) strata::core::progress_now_ms() / 1000.0);
                 }
                 (void) ver.wait_commit(err);
+                if (ajob) (void) adapt_tick(true);
                 if (!net_refill(err)) std::fprintf(stderr, "strata serve: second PC: refilling the lent slots failed: %s\n", err.c_str());
             }
         }

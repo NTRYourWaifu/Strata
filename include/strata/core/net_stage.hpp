@@ -23,6 +23,14 @@ namespace strata::core {
 /// adaptive round now instead of right after its reply, where the next window may already be waiting (H-42).
 constexpr int32_t NetCommitIdle = 1;
 
+/// A bit of NetRunHead::want_R / NetPrefillHead::want_R (protocol 5): the message's rows - the hand-off, and the
+/// reply's residual rows - travel as bf16 (STRATA_NET_HALF=1 on the first PC).  Half the bytes on the wire; the rows
+/// round to bf16 once at the split, so the answers differ slightly from the float path.
+constexpr int32_t NetRowsBf16 = 2;
+/// float <-> bf16 (round to nearest even) for the rows on the wire
+void net_to_bf16(const float* in, uint16_t* out, size_t n);
+void net_from_bf16(const uint16_t* in, float* out, size_t n);
+
 /// One message: [u32 magic][u32 op][u64 bytes] then the payload.
 enum class NetOp : uint32_t {
     Hello = 1,    ///< first -> second: geometry; reply: vocab
@@ -39,7 +47,8 @@ enum class NetOp : uint32_t {
 };
 
 struct NetHello {
-    uint32_t version = 4;   // 2: Save / Restore (conversation checkpoints); 3: Prefill (the batched prompt path); 4: Cvec
+    uint32_t version = 5;   // 2: Save / Restore (conversation checkpoints); 3: Prefill (the batched prompt path); 4: Cvec;
+                            // 5: NetRowsBf16
     int32_t split = 0;          ///< K: the second PC's first layer
     int32_t n_layers = 0, n_embd = 0, hc = 0;
     int32_t max_t = 0;
@@ -126,17 +135,24 @@ public:
     /// The stream the rows are copied on (null: cudaMemcpy).  A non-blocking stream keeps the copy from waiting for
     /// this PC's windows in flight (--pipeline-windows across two PCs: NetPipe's thread copies while stage 0 runs).
     void* R_stream = nullptr;
+    /// Set instead (NetPipe's thread): the rows go to this page-locked host buffer with a plain memcpy - no CUDA call
+    /// on that thread - and the drafter stages them onto its device on its own stream (MtpDrafter::stage_source_R).
+    float* R_host = nullptr;
     /// Milliseconds spent waiting for the second PC (send + its stage + receive), summed.
     double ms_remote = 0;
     double ms_rcopy = 0;            ///< ... of which the residual rows' copy to the device
     int64_t windows = 0;
     uint64_t bytes_sent = 0;
+    /// STRATA_NET_HALF=1: the rows go both ways as bf16 (NetRowsBf16), read at connect
+    bool half = false;
 
 private:
     NetConn c_;
     int64_t vocab_ = 0;
     std::vector<uint8_t> buf_;
     std::vector<int32_t> hist_h_;
+    std::vector<uint16_t> half_out_;   // this window's / chunk's rows as bf16
+    std::vector<float> half_in_;       // the reply's bf16 rows back as floats
     bool reply(std::string& err, std::vector<uint8_t>* payload = nullptr);
 };
 
@@ -145,7 +161,10 @@ private:
 /// verified windows, so one window at a time is in flight here and the other PC needs nothing new: `launch` hands the
 /// window to a thread that sends it and waits for the reply (NetLink::run), `done` polls, `finish` reads the picks.
 /// The final residual rows land in R[par] (the window's parity): the drafter reads one window's rows while the next
-/// window's reply comes in.  R[0] is the link's own buffer (the serial loop's), R[1] is allocated here.
+/// window's reply comes in.  Both are page-locked HOST buffers (H-42, 10-12): the thread copies the reply into one with
+/// memcpy and makes no CUDA call at all - a copy queued to a card while a window there spins on a host flag can block
+/// in the driver (upstream issue #31), and a thread blocked there can hold up the decode loop that window waits for.
+/// The drafter stages the rows onto its device on its own stream from the decode loop (MtpDrafter::stage_source_R).
 class NetPipe {
 public:
     ~NetPipe();
@@ -157,7 +176,7 @@ public:
     bool in_flight() const { return busy_; }
     /// The reply (or an error) is in.
     bool done() const;
-    /// After `done`: the picks (`out` may be null: a drained window).  The link's rows buffer is R[0] again.
+    /// After `done`: the picks (`out` may be null: a drained window).
     bool finish(int32_t* out, std::string& err);
     /// The commit of the window just finished (nothing in flight; no reply: see NetLink::commit).
     bool commit(int n_keep, std::string& err, int32_t flags) { return link_->commit(n_keep, err, flags); }

@@ -1387,8 +1387,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
 bool MtpDrafter::stage_source_R(int T, std::string& err) {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
+    // cudaMemcpyDefault: the rows may sit in page-locked host memory (H-42: across two PCs NetPipe's thread puts them
+    // there, so that thread makes no CUDA call); otherwise on a device, as before
     if (cudaMemcpyAsync((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                        cudaMemcpyDefault, cs_) != cudaSuccess) {
         err = "mtp: staging the window's residual rows failed";
         return false;
     }
