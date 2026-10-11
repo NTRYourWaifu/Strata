@@ -2968,6 +2968,28 @@ bool Verifier::copy_logits(int t, float* host) const {
 
 namespace {
 double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
+// H-42 fork (10-12): the pipelined polls (service's 2 ms WDDM flush, done()) query the window's event and flush its
+// stream without the device switch - cudaEventQuery works on any device's event, and the stream carries its own
+// context.  The stall #1741 left (a three-stage two-PC split, 0.1.42, ~1 in 500 requests) had the host blocked inside
+// the OnDevice guard's cudaSetDevice at the end of service's flush, both stages waiting on it; done() switched the
+// device on every pass while a window's tail ran.  STRATA_FLUSH_NO_SWITCH=0 keeps the switch; a query that refuses
+// the foreign device turns it back on, said once.
+std::atomic<int> g_no_switch{-1};
+bool flush_no_switch() {
+    int v = g_no_switch.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("STRATA_FLUSH_NO_SWITCH");
+        v = e == nullptr || std::atoi(e) != 0 ? 1 : 0;
+        g_no_switch.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+void flush_switch_back(cudaError_t e) {
+    if (g_no_switch.exchange(0) == 1)
+        std::fprintf(stderr, "strata verify: the poll without the device switch was refused (%s): switching again\n",
+                     cudaGetErrorString(e));
+    (void) cudaGetLastError();
+}
 }  // namespace
 
 void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
@@ -3088,6 +3110,20 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     if (!ar_on() && *(volatile uint32_t*) h_seq_ < (uint32_t) (fl_k_ + 1)) {
         const double now = now_ms();
         if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
+        // the flush is due: without the device switch while the graph still runs (H-42 fork, see flush_no_switch)
+        if (now - fl_since_ms_ <= 20000.0 && flush_no_switch()) {
+            const double was = fl_flush_ms_;
+            fl_flush_ms_ = now;
+            const cudaError_t q = cudaEventQuery(ev_done_);
+            if (q == cudaErrorNotReady) {
+                const cudaError_t s = cudaStreamQuery(cs_);
+                if (s == cudaSuccess || s == cudaErrorNotReady) return 0;
+                flush_switch_back(s);
+            } else if (q != cudaSuccess) {
+                flush_switch_back(q);
+            }
+            fl_flush_ms_ = was;   // finished, failed or refused: the loop below asks again under the device and says which
+        }
     }
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
@@ -3172,6 +3208,22 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 
 bool Verifier::done(std::string& err) {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
+    if (flush_no_switch()) {   // H-42 fork: the poll while the tail runs, without the device switch (see flush_no_switch)
+        const cudaError_t q = cudaEventQuery(ev_done_);
+        if (q == cudaErrorNotReady) {
+            const double now = now_ms();
+            if (now - fl_since_ms_ <= 20000.0) {
+                if (now - fl_flush_ms_ > 2.0) {
+                    fl_flush_ms_ = now;
+                    const cudaError_t s = cudaStreamQuery(cs_);
+                    if (s != cudaSuccess && s != cudaErrorNotReady) flush_switch_back(s);
+                }
+                return false;
+            }
+        } else if (q != cudaSuccess) {
+            flush_switch_back(q);
+        }
+    }
     const OnDevice on_device(device_);
     const cudaError_t q = cudaEventQuery(ev_done_);
     if (q == cudaErrorNotReady) {
