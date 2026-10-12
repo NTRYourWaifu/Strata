@@ -8959,17 +8959,26 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
-        // H-49 (fork): idle release.  STRATA_IDLE_RELEASE_S=N: N seconds after the last request the RAM copy's lock is
-        // handed back (src.idle_release: other programs get only what they need of it); the next request locks it
-        // again before it starts.  STRATA_IDLE_RELEASE_FILE: a file whose first character '0' turns it off (checked
-        // every 5 s; no file = on).  STRATA_IDLE_RELEASE_STATE: a JSON file this writes the state to, for the UI.
+        // H-49 (fork): idle release.  Between requests the RAM copy's lock is handed back (src.idle_release: other
+        // programs get only what they need of it, Windows trims only under pressure) once the engine has been idle
+        // STRATA_IDLE_RELEASE_S seconds AND the RAM available falls under STRATA_IDLE_RELEASE_LOW_GIB (default 1.5) -
+        // with RAM to spare nothing would be taken anyway, and the next request would pay the relock for nothing.  The
+        // next request locks it again before it starts.  STRATA_IDLE_RELEASE_FILE: a file whose first character '0'
+        // turns it off (checked every second; no file = on; switched off while handed back = locked again at once).
+        // STRATA_IDLE_RELEASE_STATE: a JSON file this writes the state to, for the UI (how much was taken, an estimate
+        // of the relock time, the relock's progress).
         const double idle_s = [] {
             const char* v = std::getenv("STRATA_IDLE_RELEASE_S");
             return v != nullptr ? std::atof(v) : 0.0;
         }();
+        const double idle_low_gib = [] {
+            const char* v = std::getenv("STRATA_IDLE_RELEASE_LOW_GIB");
+            return v != nullptr && std::atof(v) >= 0 ? std::atof(v) : 1.5;
+        }();
         const char* idle_file = std::getenv("STRATA_IDLE_RELEASE_FILE");
         const char* idle_state = std::getenv("STRATA_IDLE_RELEASE_STATE");
-        uint64_t idle_ws0 = 0;   // the working set when the lock was handed back
+        double relock_base_s = 0.3, relock_s_per_gib = 2.4;   // the estimate (10-13: 6.74 GiB back in 16.7 s), calibrated by every relock
+        double last_relock_s = -1, last_relock_gib = 0;
         auto idle_on = [&]() -> bool {
             if (idle_file == nullptr) return true;
             std::FILE* f = std::fopen(idle_file, "rb");
@@ -8978,57 +8987,102 @@ int main(int argc, char** argv) {
             std::fclose(f);
             return c != '0';
         };
-        auto idle_write = [&](bool on) {
+        auto idle_write = [&](bool on, double missing_gib, bool relocking, double pct) {
             if (idle_state == nullptr) return;
-            const uint64_t ws = strata::platform::process_working_set();
-            const uint64_t given = src.idle_released() && idle_ws0 > ws ? idle_ws0 - ws : 0;
             const std::string tmp = std::string(idle_state) + ".tmp";
             std::FILE* f = std::fopen(tmp.c_str(), "wb");
             if (f == nullptr) return;
-            std::fprintf(f, "{\"enabled\": %s, \"released\": %s, \"locked_gib\": %.2f, \"given_back_gib\": %.2f, "
-                            "\"working_set_gib\": %.2f, \"idle_s\": %.0f, \"time\": %lld}\n",
-                         on ? "true" : "false", src.idle_released() ? "true" : "false",
-                         (double) src.locked_bytes() / 1073741824.0, (double) given / 1073741824.0,
-                         (double) ws / 1073741824.0, idle_s, (long long) std::time(nullptr));
+            std::fprintf(f, "{\"enabled\": %s, \"released\": %s, \"relocking\": %s, \"relock_pct\": %.0f, "
+                            "\"given_back_gib\": %.2f, \"est_reload_s\": %.1f, \"last_reload_s\": %.1f, "
+                            "\"last_reload_gib\": %.2f, \"locked_gib\": %.2f, \"time\": %lld}\n",
+                         on ? "true" : "false", src.idle_released() ? "true" : "false", relocking ? "true" : "false", pct,
+                         missing_gib, relock_base_s + missing_gib * relock_s_per_gib, last_relock_s, last_relock_gib,
+                         (double) src.locked_bytes() / 1073741824.0, (long long) std::time(nullptr));
             std::fclose(f);
             std::remove(idle_state);
             std::rename(tmp.c_str(), idle_state);
         };
         auto idle_relock = [&](const char* why) {
+            const bool on = idle_on();
+            const double missing = (double) src.idle_missing_bytes() / 1073741824.0;
+            idle_write(on, missing, true, 0);
+            const auto t0 = Clock::now();
+            auto last = t0;
             std::string note;
-            const bool ok = src.idle_relock(note);
-            std::fprintf(stderr, "strata serve: idle release: %s (%s)%s\n", note.c_str(), why,
-                         ok ? "" : " - WARNING: not all of it");
+            const bool ok = src.idle_relock(note, [&](uint64_t done, uint64_t total) {
+                if (Clock::now() - last < std::chrono::milliseconds(250)) return;
+                last = Clock::now();
+                idle_write(on, missing, true, 100.0 * (double) done / (double) total);
+            });
+            const double sec = std::chrono::duration<double>(Clock::now() - t0).count();
+            last_relock_s = sec, last_relock_gib = missing;
+            if (missing < 0.0625) relock_base_s = sec;
+            else if (sec > relock_base_s) relock_s_per_gib = (sec - relock_base_s) / missing;
+            idle_write(on, 0, false, 100);
+            std::fprintf(stderr, "strata serve: idle release: %s (%s; %.2f GiB had been taken)%s\n", note.c_str(), why,
+                         missing, ok ? "" : " - WARNING: not all of it");
             std::fflush(stderr);
         };
         const bool idle_armed = idle_s > 0 && src.locked_bytes() > 0;
         if (idle_armed) {
-            std::fprintf(stderr, "strata serve: idle release armed: %.0f s after the last request, %.2f GiB%s\n", idle_s,
+            std::fprintf(stderr, "strata serve: idle release armed: %.0f s after the last request, under %.1f GiB of RAM "
+                                 "available, %.2f GiB%s\n", idle_s, idle_low_gib,
                          (double) src.locked_bytes() / 1073741824.0, idle_file != nullptr ? " (switch file set)" : "");
-            idle_write(idle_on());
+            idle_write(idle_on(), 0, false, 100);
         }
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
             if (idle_armed) {
                 const auto since = Clock::now();
                 bool was_on = idle_on();
+                double was_missing = -1;
+                bool was_released = src.idle_released();
                 while (in_lines.empty() && !in_eof) {
-                    if (in_cv.wait_for(lk, std::chrono::seconds(5), [&] { return !in_lines.empty() || in_eof; })) break;
+                    if (in_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !in_lines.empty() || in_eof; })) break;
                     lk.unlock();
                     const bool on = idle_on();
                     if (on && !src.idle_released() &&
                         std::chrono::duration<double>(Clock::now() - since).count() >= idle_s) {
-                        std::string note;
-                        idle_ws0 = strata::platform::process_working_set();
-                        if (src.idle_release(note)) {
-                            std::fprintf(stderr, "strata serve: idle release: %s\n", note.c_str());
-                            std::fflush(stderr);
+                        uint64_t avail = 0;
+#if defined(_WIN32)
+                        MEMORYSTATUSEX ms{};
+                        ms.dwLength = sizeof ms;
+                        if (GlobalMemoryStatusEx(&ms)) avail = ms.ullAvailPhys;
+#endif
+                        if ((double) avail / 1073741824.0 < idle_low_gib) {
+                            std::string note;
+                            if (src.idle_release(note)) {
+                                std::fprintf(stderr, "strata serve: idle release: %s (%.2f GiB of RAM available)\n",
+                                             note.c_str(), (double) avail / 1073741824.0);
+                                std::fflush(stderr);
+                            }
+                        }
+                    } else if (on && src.idle_released()) {
+                        // the soft minimum alone lets Windows trim the other programs first: hand over what they
+                        // are short of (up to the low mark, 2 GiB a second at most) ourselves
+                        uint64_t avail = 0;
+#if defined(_WIN32)
+                        MEMORYSTATUSEX ms{};
+                        ms.dwLength = sizeof ms;
+                        if (GlobalMemoryStatusEx(&ms)) avail = ms.ullAvailPhys;
+#endif
+                        const double short_gib = idle_low_gib - (double) avail / 1073741824.0;
+                        if (avail > 0 && short_gib > 0) {
+                            const uint64_t want = std::min<uint64_t>(2ull << 30, (uint64_t) ((short_gib + 0.25) * 1073741824.0));
+                            const uint64_t gave = src.idle_give_back(want);
+                            if (gave > 0) {
+                                std::fprintf(stderr, "strata serve: idle release: handed %.2f GiB over (%.2f GiB of RAM available)\n",
+                                             (double) gave / 1073741824.0, (double) avail / 1073741824.0);
+                                std::fflush(stderr);
+                            }
                         }
                     } else if (!on && src.idle_released()) {
                         idle_relock("switched off");
                     }
-                    if (on != was_on || src.idle_released()) idle_write(on);
-                    was_on = on;
+                    const double missing = (double) src.idle_missing_bytes() / 1073741824.0;
+                    if (on != was_on || src.idle_released() != was_released || std::fabs(missing - was_missing) >= 0.02)
+                        idle_write(on, missing, false, 100);
+                    was_on = on, was_missing = missing, was_released = src.idle_released();
                     lk.lock();
                 }
             } else {
@@ -9038,10 +9092,7 @@ int main(int argc, char** argv) {
             out = std::move(in_lines.front());
             in_lines.pop_front();
             lk.unlock();
-            if (src.idle_released() && out != "QUIT") {
-                idle_relock("a request");
-                idle_write(idle_on());
-            }
+            if (src.idle_released() && out != "QUIT") idle_relock("a request");
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };

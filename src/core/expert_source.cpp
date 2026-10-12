@@ -946,6 +946,7 @@ bool FileExpertSource::idle_release(std::string& note) {
     }
     strata::platform::soften_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
     idle_released_ = true;
+    idle_evict_end_ = complement_locked_;
     char msg[160];
     std::snprintf(msg, sizeof msg, "%.2f GiB of the RAM copy unlocked (it stays in RAM until another program needs it)",
                   (double) complement_locked_ / 1073741824.0);
@@ -953,13 +954,26 @@ bool FileExpertSource::idle_release(std::string& note) {
     return true;
 }
 
-bool FileExpertSource::idle_relock(std::string& note) {
+uint64_t FileExpertSource::idle_give_back(uint64_t want) {
+    if (!idle_released_ || complement_arena_ == nullptr || idle_evict_end_ == 0 || want == 0) return 0;
+    const uint64_t n = want < idle_evict_end_ ? want : idle_evict_end_;
+    idle_evict_end_ -= n;
+    strata::platform::evict_resident((uint8_t*) complement_arena_ + complement_lock_off_ + idle_evict_end_, n);
+    return n;
+}
+
+uint64_t FileExpertSource::idle_missing_bytes() const {
+    if (!idle_released_ || complement_arena_ == nullptr || complement_locked_ == 0) return 0;
+    return strata::platform::missing_resident((const uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+}
+
+bool FileExpertSource::idle_relock(std::string& note, const std::function<void(uint64_t, uint64_t)>& progress) {
     if (!idle_released_) { note.clear(); return true; }
     const auto t0 = std::chrono::steady_clock::now();
     const uint64_t ws0 = strata::platform::process_working_set();
     // the pages back from the page file, then locked; the memory manager pushes other programs' pages out to supply them
     strata::platform::LockResult r =
-        strata::platform::relock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+        strata::platform::relock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_, progress);
     idle_released_ = false;
     const uint64_t ws1 = strata::platform::process_working_set();
     char msg[200];

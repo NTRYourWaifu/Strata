@@ -80,15 +80,38 @@ void soften_resident(void* p, uint64_t bytes) {
         VirtualUnlock((uint8_t*) p + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk));
 }
 
-LockResult relock_resident(void* p, uint64_t bytes) {
+void evict_resident(void* p, uint64_t bytes) {
+    if (p == nullptr || bytes == 0) return;
+    const uint64_t chunk = 256ull << 20;
+    for (uint64_t off = 0; off < bytes; off += chunk)
+        VirtualUnlock((uint8_t*) p + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk));   // ERROR_NOT_LOCKED is expected
+}
+
+uint64_t missing_resident(const void* p, uint64_t bytes, uint32_t stride) {
+    if (p == nullptr || bytes == 0) return 0;
+    if (stride == 0) stride = 1;
+    const uint64_t step = (uint64_t) stride * 4096;
+    const size_t n = (size_t) ((bytes + step - 1) / step);
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> info(n);
+    for (size_t i = 0; i < n; ++i) info[i].VirtualAddress = (PVOID) ((const uint8_t*) p + i * step);
+    if (!K32QueryWorkingSetEx(GetCurrentProcess(), info.data(), (DWORD) (n * sizeof(info[0])))) return 0;
+    uint64_t out = 0;
+    for (const auto& e : info) if (!e.VirtualAttributes.Valid) ++out;
+    out *= step;
+    return out < bytes ? out : bytes;
+}
+
+LockResult relock_resident(void* p, uint64_t bytes, const std::function<void(uint64_t, uint64_t)>& progress) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
     uint8_t* base = (uint8_t*) p;
     const uint64_t chunk = 1ull << 30;
-    // the trimmed pages back from the page file in large reads first (VirtualLock alone faults them one cluster at a time)
+    // the trimmed pages back from the page file in large reads first (VirtualLock alone faults them one cluster at a
+    // time); skipped when (almost) nothing was trimmed - then only the locking is left
     using Prefetch = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
     static const Prefetch prefetch = (Prefetch) (void*) GetProcAddress(GetModuleHandleA("kernel32.dll"), "PrefetchVirtualMemory");
-    if (prefetch != nullptr) {
+    const bool fetch = prefetch != nullptr && missing_resident(p, bytes) >= (64ull << 20);
+    if (fetch) {
         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
         for (uint64_t off = 0; off < bytes; off += chunk)
             ranges.push_back({base + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk)});
@@ -104,9 +127,10 @@ LockResult relock_resident(void* p, uint64_t bytes) {
             return r;
         }
         r.locked_bytes = off + n;
+        if (progress) progress(r.locked_bytes, bytes);
     }
     r.ok = true;
-    r.note = std::string("locked again via VirtualLock") + (prefetch != nullptr ? " after PrefetchVirtualMemory" : "");
+    r.note = std::string("locked again via VirtualLock") + (fetch ? " after PrefetchVirtualMemory" : "");
     return r;
 }
 
@@ -220,7 +244,13 @@ void unlock_resident(void* p, uint64_t bytes) {
 
 void soften_resident(void* p, uint64_t bytes) { unlock_resident(p, bytes); }
 
-LockResult relock_resident(void* p, uint64_t bytes) { return lock_resident(p, bytes); }
+LockResult relock_resident(void* p, uint64_t bytes, const std::function<void(uint64_t, uint64_t)>&) {
+    return lock_resident(p, bytes);
+}
+
+void evict_resident(void*, uint64_t) {}
+
+uint64_t missing_resident(const void*, uint64_t, uint32_t) { return 0; }
 
 uint64_t make_room(uint64_t, std::string& note) {
     note = "make_room is Windows-only";

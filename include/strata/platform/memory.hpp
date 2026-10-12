@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace strata::platform {
@@ -30,7 +31,18 @@ void soften_resident(void* p, uint64_t bytes);
 
 /// H-49 (fork): lock again a region soften_resident unlocked - its trimmed pages back from the page file
 /// (PrefetchVirtualMemory, then VirtualLock; the minimum is still raised).  Linux: mlock.
-LockResult relock_resident(void* p, uint64_t bytes);
+LockResult relock_resident(void* p, uint64_t bytes,
+                           const std::function<void(uint64_t done, uint64_t total)>& progress = nullptr);
+
+/// H-49 (fork): push [p, p + bytes) of an unlocked region out of this process's working set now (VirtualUnlock on
+/// pages that are not locked drops them from it; they go to the page file and their RAM to whoever needs it).  The
+/// soft minimum alone lets the memory manager trim the other programs first, so the idle loop hands pages over itself.
+/// No-op elsewhere than Windows.
+void evict_resident(void* p, uint64_t bytes);
+
+/// H-49 (fork): about how many bytes of [p, p + bytes) are out of this process's working set (trimmed), from every
+/// `stride`-th page (QueryWorkingSetEx; a few ms for 19 GiB at 32).  0 elsewhere than Windows.
+uint64_t missing_resident(const void* p, uint64_t bytes, uint32_t stride = 32);
 
 /// H-49 (fork), Windows: make `want` bytes of RAM available by pushing other programs' pages to the page file -
 /// commit a block, write every page of it (the memory manager trims the other working sets to supply them), free it.
