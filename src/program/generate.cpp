@@ -98,6 +98,7 @@
 
 #include <array>
 #include <chrono>
+#include <ctime>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -8958,12 +8959,89 @@ int main(int argc, char** argv) {
             in_eof = true;
             in_cv.notify_one();
         }).detach();
+        // H-49 (fork): idle release.  STRATA_IDLE_RELEASE_S=N: N seconds after the last request the RAM copy's lock is
+        // handed back (src.idle_release: other programs get only what they need of it); the next request locks it
+        // again before it starts.  STRATA_IDLE_RELEASE_FILE: a file whose first character '0' turns it off (checked
+        // every 5 s; no file = on).  STRATA_IDLE_RELEASE_STATE: a JSON file this writes the state to, for the UI.
+        const double idle_s = [] {
+            const char* v = std::getenv("STRATA_IDLE_RELEASE_S");
+            return v != nullptr ? std::atof(v) : 0.0;
+        }();
+        const char* idle_file = std::getenv("STRATA_IDLE_RELEASE_FILE");
+        const char* idle_state = std::getenv("STRATA_IDLE_RELEASE_STATE");
+        uint64_t idle_ws0 = 0;   // the working set when the lock was handed back
+        auto idle_on = [&]() -> bool {
+            if (idle_file == nullptr) return true;
+            std::FILE* f = std::fopen(idle_file, "rb");
+            if (f == nullptr) return true;
+            const int c = std::fgetc(f);
+            std::fclose(f);
+            return c != '0';
+        };
+        auto idle_write = [&](bool on) {
+            if (idle_state == nullptr) return;
+            const uint64_t ws = strata::platform::process_working_set();
+            const uint64_t given = src.idle_released() && idle_ws0 > ws ? idle_ws0 - ws : 0;
+            const std::string tmp = std::string(idle_state) + ".tmp";
+            std::FILE* f = std::fopen(tmp.c_str(), "wb");
+            if (f == nullptr) return;
+            std::fprintf(f, "{\"enabled\": %s, \"released\": %s, \"locked_gib\": %.2f, \"given_back_gib\": %.2f, "
+                            "\"working_set_gib\": %.2f, \"idle_s\": %.0f, \"time\": %lld}\n",
+                         on ? "true" : "false", src.idle_released() ? "true" : "false",
+                         (double) src.locked_bytes() / 1073741824.0, (double) given / 1073741824.0,
+                         (double) ws / 1073741824.0, idle_s, (long long) std::time(nullptr));
+            std::fclose(f);
+            std::remove(idle_state);
+            std::rename(tmp.c_str(), idle_state);
+        };
+        auto idle_relock = [&](const char* why) {
+            std::string note;
+            const bool ok = src.idle_relock(note);
+            std::fprintf(stderr, "strata serve: idle release: %s (%s)%s\n", note.c_str(), why,
+                         ok ? "" : " - WARNING: not all of it");
+            std::fflush(stderr);
+        };
+        const bool idle_armed = idle_s > 0 && src.locked_bytes() > 0;
+        if (idle_armed) {
+            std::fprintf(stderr, "strata serve: idle release armed: %.0f s after the last request, %.2f GiB%s\n", idle_s,
+                         (double) src.locked_bytes() / 1073741824.0, idle_file != nullptr ? " (switch file set)" : "");
+            idle_write(idle_on());
+        }
         auto next_line = [&](std::string& out) -> bool {
             std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+            if (idle_armed) {
+                const auto since = Clock::now();
+                bool was_on = idle_on();
+                while (in_lines.empty() && !in_eof) {
+                    if (in_cv.wait_for(lk, std::chrono::seconds(5), [&] { return !in_lines.empty() || in_eof; })) break;
+                    lk.unlock();
+                    const bool on = idle_on();
+                    if (on && !src.idle_released() &&
+                        std::chrono::duration<double>(Clock::now() - since).count() >= idle_s) {
+                        std::string note;
+                        idle_ws0 = strata::platform::process_working_set();
+                        if (src.idle_release(note)) {
+                            std::fprintf(stderr, "strata serve: idle release: %s\n", note.c_str());
+                            std::fflush(stderr);
+                        }
+                    } else if (!on && src.idle_released()) {
+                        idle_relock("switched off");
+                    }
+                    if (on != was_on || src.idle_released()) idle_write(on);
+                    was_on = on;
+                    lk.lock();
+                }
+            } else {
+                in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+            }
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
+            lk.unlock();
+            if (src.idle_released() && out != "QUIT") {
+                idle_relock("a request");
+                idle_write(idle_on());
+            }
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };

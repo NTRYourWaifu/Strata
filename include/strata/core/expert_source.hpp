@@ -578,6 +578,12 @@ public:
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
     uint64_t locked_bytes() const { return complement_locked_; }
+    /// H-49 (fork): while the engine is idle, hand the working-set lock of the RAM copy back (the pages stay until
+    /// another program needs them, and Windows takes only those); `idle_relock` takes everything back before the
+    /// next request.  The page-locked (pinned) part, if any, is not touched.  `note` is for the log.
+    bool idle_release(std::string& note);
+    bool idle_relock(std::string& note);
+    bool idle_released() const { return idle_released_; }
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
 
@@ -848,6 +854,7 @@ private:
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
+    bool idle_released_ = false;              ///< H-49: the lock above is handed back while idle
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer

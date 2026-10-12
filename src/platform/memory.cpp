@@ -6,6 +6,10 @@
 #define NOMINMAX
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <psapi.h>
+#include <chrono>
+#include <vector>
+#include <cstdio>
 #include <cstring>
 #else
 #include <algorithm>
@@ -64,6 +68,88 @@ void unlock_resident(void* p, uint64_t bytes) {
     const uint64_t chunk = 1ull << 30;
     for (uint64_t off = 0; off < bytes; off += chunk)
         VirtualUnlock((uint8_t*) p + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk));
+}
+
+void soften_resident(void* p, uint64_t bytes) {
+    if (p == nullptr || bytes == 0) return;
+    // Only VirtualUnlock: the minimum lock_resident raised stays, and it is a soft one (QUOTA_LIMITS_HARDWS_MIN_DISABLE),
+    // so the memory manager trims below it when another program needs the RAM - oldest pages first, which are these.
+    // Lowering it instead made relock_resident's raise fail (error 1450) once the others had the RAM (10-13).
+    const uint64_t chunk = 1ull << 30;
+    for (uint64_t off = 0; off < bytes; off += chunk)
+        VirtualUnlock((uint8_t*) p + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk));
+}
+
+LockResult relock_resident(void* p, uint64_t bytes) {
+    LockResult r;
+    if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
+    uint8_t* base = (uint8_t*) p;
+    const uint64_t chunk = 1ull << 30;
+    // the trimmed pages back from the page file in large reads first (VirtualLock alone faults them one cluster at a time)
+    using Prefetch = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const Prefetch prefetch = (Prefetch) (void*) GetProcAddress(GetModuleHandleA("kernel32.dll"), "PrefetchVirtualMemory");
+    if (prefetch != nullptr) {
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+        for (uint64_t off = 0; off < bytes; off += chunk)
+            ranges.push_back({base + off, (SIZE_T) (bytes - off < chunk ? bytes - off : chunk)});
+        (void) prefetch(GetCurrentProcess(), (ULONG_PTR) ranges.size(), ranges.data(), 0);
+    }
+    // the minimum is still raised (soften_resident keeps it): only the pages
+    for (uint64_t off = 0; off < bytes; off += chunk) {
+        const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
+        if (!VirtualLock(base + off, (SIZE_T) n)) {
+            r.note = "VirtualLock stopped at " + std::to_string((unsigned long long) (off >> 20)) + " of " +
+                     std::to_string((unsigned long long) (bytes >> 20)) + " MiB (error " + std::to_string(GetLastError()) + ")";
+            r.ok = off > 0;
+            return r;
+        }
+        r.locked_bytes = off + n;
+    }
+    r.ok = true;
+    r.note = std::string("locked again via VirtualLock") + (prefetch != nullptr ? " after PrefetchVirtualMemory" : "");
+    return r;
+}
+
+uint64_t make_room(uint64_t want, std::string& note) {
+    MEMORYSTATUSEX ms{};
+    auto avail = [&]() -> uint64_t {
+        ms.dwLength = sizeof ms;
+        return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPhys : 0;
+    };
+    const uint64_t before = avail();
+    const uint64_t keep = 3ull << 30;
+    if (ms.ullTotalPhys > keep && want > ms.ullTotalPhys - keep) want = ms.ullTotalPhys - keep;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t now = before;
+    int rounds = 0;
+    // The block is the whole target, not the shortfall: its first pages come from the free and standby lists (which
+    // already count as available), and only the rest makes the memory manager trim the other working sets.  Freed,
+    // all of it is free.  A few rounds: a program that is running pulls part of its pages back at once.
+    for (; rounds < 3 && now < want; ++rounds) {
+        const uint64_t need = want + (512ull << 20);
+        uint8_t* b = (uint8_t*) VirtualAlloc(nullptr, (SIZE_T) need, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (b == nullptr) {
+            note = "VirtualAlloc of " + std::to_string((unsigned long long) (need >> 20)) + " MiB failed (error " +
+                   std::to_string(GetLastError()) + "); ";
+            break;
+        }
+        for (uint64_t off = 0; off < need; off += 4096) ((volatile uint8_t*) b)[off] = 1;
+        VirtualFree(b, 0, MEM_RELEASE);
+        now = avail();
+    }
+    char msg[200];
+    std::snprintf(msg, sizeof msg, "available RAM %.2f -> %.2f GiB (wanted %.2f) in %.1f s, %d round%s",
+                  (double) before / 1073741824.0, (double) now / 1073741824.0, (double) want / 1073741824.0,
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), rounds,
+                  rounds == 1 ? "" : "s");
+    note += msg;
+    return now;
+}
+
+uint64_t process_working_set() {
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof pmc;
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? (uint64_t) pmc.WorkingSetSize : 0;
 }
 
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why) {
@@ -131,6 +217,18 @@ LockResult lock_resident(void* p, uint64_t bytes) {
 void unlock_resident(void* p, uint64_t bytes) {
     if (p != nullptr && bytes != 0) munlock(p, bytes);
 }
+
+void soften_resident(void* p, uint64_t bytes) { unlock_resident(p, bytes); }
+
+LockResult relock_resident(void* p, uint64_t bytes) { return lock_resident(p, bytes); }
+
+uint64_t make_room(uint64_t, std::string& note) {
+    note = "make_room is Windows-only";
+    const long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+}
+
+uint64_t process_working_set() { return 0; }
 
 bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
     budget = usage = 0;

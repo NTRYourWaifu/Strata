@@ -23,6 +23,24 @@ LockResult lock_resident(void* p, uint64_t bytes);
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 
+/// H-49 (fork): unlock a region lock_resident locked, keeping the (soft) working-set minimum it raised.  The pages stay
+/// in RAM; Windows trims only the ones another program needs, oldest first.  relock_resident takes them back.
+/// Linux: munlock.
+void soften_resident(void* p, uint64_t bytes);
+
+/// H-49 (fork): lock again a region soften_resident unlocked - its trimmed pages back from the page file
+/// (PrefetchVirtualMemory, then VirtualLock; the minimum is still raised).  Linux: mlock.
+LockResult relock_resident(void* p, uint64_t bytes);
+
+/// H-49 (fork), Windows: make `want` bytes of RAM available by pushing other programs' pages to the page file -
+/// commit a block, write every page of it (the memory manager trims the other working sets to supply them), free it.
+/// Never asks for the machine's last 3 GiB.  Returns the RAM available afterwards; `note` says what happened.
+/// Elsewhere: returns what is available and does nothing.
+uint64_t make_room(uint64_t want, std::string& note);
+
+/// This process's working set in bytes (0 when unknown).
+uint64_t process_working_set();
+
 /// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
 /// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
 /// 8 bytes at `luid` (cudaDeviceProp::luid).  Page-locked host memory the GPU maps is charged there.  False (and

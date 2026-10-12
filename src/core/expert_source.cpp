@@ -939,6 +939,38 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
     return true;
 }
 
+bool FileExpertSource::idle_release(std::string& note) {
+    if (idle_released_ || complement_arena_ == nullptr || complement_locked_ == 0) {
+        note = "nothing locked to hand back";
+        return false;
+    }
+    strata::platform::soften_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+    idle_released_ = true;
+    char msg[160];
+    std::snprintf(msg, sizeof msg, "%.2f GiB of the RAM copy unlocked (it stays in RAM until another program needs it)",
+                  (double) complement_locked_ / 1073741824.0);
+    note = msg;
+    return true;
+}
+
+bool FileExpertSource::idle_relock(std::string& note) {
+    if (!idle_released_) { note.clear(); return true; }
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t ws0 = strata::platform::process_working_set();
+    // the pages back from the page file, then locked; the memory manager pushes other programs' pages out to supply them
+    strata::platform::LockResult r =
+        strata::platform::relock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+    idle_released_ = false;
+    const uint64_t ws1 = strata::platform::process_working_set();
+    char msg[200];
+    std::snprintf(msg, sizeof msg, "%.2f of %.2f GiB locked again in %.1f s (working set %.2f -> %.2f GiB): ",
+                  (double) r.locked_bytes / 1073741824.0, (double) complement_locked_ / 1073741824.0,
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                  (double) ws0 / 1073741824.0, (double) ws1 / 1073741824.0);
+    note = msg + r.note;
+    return r.locked_bytes >= complement_locked_;
+}
+
 void FileExpertSource::close() {
     io_stop();
     inputs_.clear();
@@ -976,6 +1008,7 @@ void FileExpertSource::close() {
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
+    idle_released_ = false;
     complement_lent_slots_ = 0;
     if (!maps_.empty()) {
         for (Map& m : maps_) {
@@ -2576,6 +2609,24 @@ bool FileExpertSource::pin_cache_complement(
             std::fprintf(stderr, "FileExpertSource: available RAM %.2f GiB, %.2f GiB after the mapped experts left the "
                                  "process working set (#467)\n",
                          (double) before / 1073741824.0, (double) after / 1073741824.0);
+    }
+    // H-49 (fork), STRATA_RESIDENT_SQUEEZE=1: the whole copy is not sized down to what the other programs left - they
+    // are pushed to the page file first (the copy, the headroom, and STRATA_SQUEEZE_EXTRA_GIB, default 3, for the
+    // split stages' lend regions and the engine's later allocations).  Only for the first try (no budget): the soft
+    // mode's second try (what fits) still follows when even that cannot make room.
+    if (budget_bytes == 0 && bytes > 0) {
+        static const bool squeeze = [] {
+            const char* v = std::getenv("STRATA_RESIDENT_SQUEEZE");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (squeeze) {
+            const char* v = std::getenv("STRATA_SQUEEZE_EXTRA_GIB");
+            const double extra_gib = v != nullptr && std::atof(v) >= 0 ? std::atof(v) : 3.0;
+            std::string note;
+            (void) strata::platform::make_room(bytes + headroom_bytes + (uint64_t) (extra_gib * 1073741824.0), note);
+            std::fprintf(stderr, "FileExpertSource: squeeze (H-49): %s\n", note.c_str());
+            std::fflush(stderr);
+        }
     }
 #endif
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
