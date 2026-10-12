@@ -1469,9 +1469,24 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     return true;
 }
 
+namespace {
+// H-42 fork (10-12): the chain polls below only query events and read mapped host memory, which needs no device
+// switch (cudaEventQuery works on any device's event).  The pipelined loop calls them on every pass while a chain
+// runs; a stall on a three-stage two-PC split (0.1.42) had the host blocked inside chain_outputs_ready's OnDevice
+// cudaSetDevice with the stages waiting on it - the shape #1740 had in Verifier::service.  STRATA_FLUSH_NO_SWITCH=0
+// keeps the switch (the same switch as verify.cpp's polls).
+bool chain_poll_no_switch() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FLUSH_NO_SWITCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+}  // namespace
+
 int MtpDrafter::chain_outputs_ready(std::string& err) {
     if (!chain_live_) return chain_n_;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(chain_poll_no_switch() ? -1 : device_);
     while (steps_seen_ < chain_early_) {
         const cudaError_t q = cudaEventQuery(ev_step_[steps_seen_]);
         if (q == cudaErrorNotReady) break;
@@ -1485,7 +1500,7 @@ int MtpDrafter::chain_outputs_ready(std::string& err) {
 
 int MtpDrafter::chain_poll(std::string& err) {
     if (!chain_live_) return 1;
-    const OnDevice on_device(device_);
+    const OnDevice on_device(chain_poll_no_switch() ? -1 : device_);   // see chain_poll_no_switch
     const cudaError_t q = cudaEventQuery(ev_chain_);
     if (q == cudaErrorNotReady) return 0;
     chain_live_ = false;
