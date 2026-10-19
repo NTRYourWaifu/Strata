@@ -511,6 +511,8 @@ void ExpertPool::worker(int id) {
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
+            // H-66: one unit of idle work (a prefetch of the next layer's predicted experts), then look again
+            if (const IdleFn f = idle_fn_.load(std::memory_order_acquire)) f(idle_ctx_.load(std::memory_order_relaxed), id);
             _mm_pause();
             if ((++spins & 1023u) != 0) continue;
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;

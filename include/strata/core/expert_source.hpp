@@ -170,6 +170,9 @@ public:
     /// A blob pointer that stays valid (not recycled) for as long as the source is open: for a copy that runs
     /// asynchronously long after the call (the adaptive tier's swap-ins).  Defaults to `blob`.
     virtual const uint8_t* blob_stable(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// H-66 (STRATA_CPU_PREFETCH): where `blob` would point, without reading, counting or faulting anything in -
+    /// only for a cache prefetch hint.  nullptr: the source cannot say (a file source).
+    virtual const uint8_t* peek(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
     /// The caller has queued an asynchronous copy out of `blob` (a pointer this source handed out) on `stream` (a
     /// cudaStream_t): the source must not overwrite or recycle that memory until the copy has finished.  A source whose
     /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
@@ -302,8 +305,66 @@ private:
     uint64_t st_layers_ = 0, st_nopred_ = 0, st_actual_ = 0, st_hit_[3] = {0, 0, 0}, st_pred_[3] = {0, 0, 0},
              st_predhit_[3] = {0, 0, 0};
     uint64_t st_windows_ = 0;
+    int64_t st_first_ = 0, st_last_ = -1;   ///< H-66: this PC's first and last layer with a router (two PCs, a split)
+    int64_t st_prev_ = 1 << 30;             ///< H-66: the last layer scored (a lower one starts a window)
+    void stats_print();
     uint64_t st_vhit_[3] = {0, 0, 0}, st_vpred_[3] = {0, 0, 0}, st_pch_ = 0, st_pcov_[3] = {0, 0, 0};
     static constexpr int kVoteN = 16;
+};
+
+/// H-66, STRATA_CPU_PREFETCH=1: the CPU experts of the NEXT layer, prefetched into the CPU's caches by the pool's own
+/// workers while they wait between two layers' batches.  After layer l's batch the dispatch hands layer l's MoE input
+/// over (`hint`); the parked workers split layer l+1's router (BF16 host copy) by rows, the last one to finish takes
+/// each token's top k, drops the experts the GPU holds, and every worker then prefetches 64 KB pieces of those blobs
+/// until layer l+1's batch arrives.  Measured on the two-PC split (H-66): the next layer's router on this layer's
+/// input finds 65% of the next layer's CPU experts (top 10, precision 56%).  Only cache hints: which experts are
+/// computed, and how, never changes, so the output is the same bit for bit.  STRATA_CPU_PREFETCH=2 predicts and does
+/// not prefetch (the A/B arm for the prediction's own cost).  A torn read of a buffer the next hint is refilling
+/// only spoils a hint (a prefetch never faults).
+class CpuPrefetch {
+public:
+    /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits (empty: a layer this PC does not run).  `src` must answer
+    /// `peek`.  False (and the reason in `err`): the prefetcher stays off.
+    bool start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k, int mode,
+               const ExpertSource* src, std::string& err);
+    /// The dispatch thread, after layer `layer`'s batch: predict and prefetch layer + 1.  `ms_run` is the dispatch's
+    /// running total of CPU-expert time (for the report line).
+    void hint(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res, double ms_run);
+    /// ExpertPool::IdleFn
+    static void idle(void* self, int worker) { static_cast<CpuPrefetch*>(self)->work(worker); }
+    int mode() const { return mode_; }
+
+private:
+    void work(int worker);
+    void select(uint64_t gen);
+    static constexpr int kMaxTok = 8, kRowsPerUnit = 32, kMaxItems = 48;
+    static constexpr uint64_t kChunk = 64 * 1024;
+    struct Buf {
+        alignas(64) std::atomic<uint32_t> rows_next{0};
+        alignas(64) std::atomic<uint32_t> rows_done{0};
+        alignas(64) std::atomic<uint32_t> chunk_next{0};
+        std::atomic<uint32_t> n_chunks{0};
+        std::atomic<uint64_t> ready{0};      ///< the gen whose list is built
+        int64_t layer = -1;
+        int nt = 0;
+        const float* x = nullptr;            ///< the dispatch's MoE input (valid until the next layer's)
+        const int32_t* host_res = nullptr;
+        std::vector<float> logits;           ///< [kMaxTok][n_expert]
+        const uint8_t* item[kMaxItems] = {};
+        uint64_t item_bytes[kMaxItems] = {};
+        uint32_t item_chunk0[kMaxItems + 1] = {};
+        int n_items = 0;
+    };
+    std::vector<std::vector<uint16_t>> routers_;
+    int64_t n_embd_ = 0, n_expert_ = 0;
+    int k_ = 10, mode_ = 1, units_ = 0;
+    const ExpertSource* src_ = nullptr;
+    Buf buf_[2];
+    alignas(64) std::atomic<uint64_t> gen_{0};
+    // the report (dispatch thread only, apart from the two atomics)
+    uint64_t hints_ = 0, ready_before_ = 0, items_sum_ = 0, chunks_sum_ = 0, chunks_done_sum_ = 0;
+    double ms_run_last_ = 0.0;
+    uint64_t hints_last_ = 0;
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -341,6 +402,8 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
+    CpuPrefetch* cpu_prefetch = nullptr;    ///< H-66: prefetches the next layer's predicted CPU experts into the caches
+    uint8_t touch_sink = 0;                 ///< H-66: STRATA_CPU_PREFETCH=3's reads land here (kept, not optimised out)
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
@@ -639,6 +702,8 @@ public:
     int64_t commit_flip();
     /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
     const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
+    /// H-66: the resident RAM copy's blob (a file read is not a cache prefetch's business)
+    const uint8_t* peek(int64_t layer, int64_t expert) const override { return resident_blob(layer, expert); }
     int64_t exchanges() const { return exchanges_; }
     bool exchange_rotation() const { return exchange_storage_.active(); }
     uint64_t rotated_exchanges() const { return exchange_storage_.exchanges(); }
@@ -940,6 +1005,7 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* peek(int64_t layer, int64_t expert) const override;
     int64_t reads() const { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;

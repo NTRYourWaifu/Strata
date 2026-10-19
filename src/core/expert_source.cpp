@@ -17,6 +17,9 @@
 #include "strata/kernels/cpu/kq_avx2.hpp"
 
 #include <cuda_runtime.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>   // H-66: _mm_prefetch
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -2231,8 +2234,8 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
                             ExpertSource* src, std::string& err, bool allow_cold_source) {
     if (src == nullptr || (!allow_cold_source && !src->warms())) { err = "RouterLookahead: the expert source does not warm"; return false; }
     if (n_embd % 8 != 0) { err = "RouterLookahead: n_embd is not a multiple of 8"; return false; }
-    for (const auto& r : routers)
-        if (r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
+    for (const auto& r : routers)   // H-66: an empty router is a layer this PC does not hold (skipped)
+        if (!r.empty() && r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
     routers_ = std::move(routers);
     n_embd_ = n_embd;
     n_expert_ = n_expert;
@@ -2247,7 +2250,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
 }
 
 void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res) {
-    if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
+    if (layer + 1 >= (int64_t) routers_.size() || routers_[(size_t) (layer + 1)].empty() || n_tok <= 0 || x == nullptr) return;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
@@ -2269,12 +2272,30 @@ void RouterLookahead::enable_stats(int64_t n_layers) {
     for (int64_t i = 0; i < n_layers; ++i) pstamp_[(size_t) i].store(0, std::memory_order_relaxed);
     pvote_.reset(new std::atomic<int32_t>[(size_t) (n_layers * kVoteN)]);
     for (int64_t i = 0; i < n_layers * kVoteN; ++i) pvote_[(size_t) i].store(0, std::memory_order_relaxed);
+    st_first_ = 0;
+    st_last_ = -1;
+    for (int64_t l = 0; l < (int64_t) routers_.size(); ++l)
+        if (!routers_[(size_t) l].empty()) {
+            if (st_last_ < 0) st_first_ = l;
+            st_last_ = l;
+        }
+    std::fprintf(stderr, "strata lookahead stats: on, routers for layers %lld..%lld here\n", (long long) st_first_,
+                 (long long) st_last_);
     stats_on_ = true;
 }
 
 // the dispatch thread: score the prediction made for `layer` against the experts it routes outside the GPU cache
 void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, const int32_t* host_res, int pcie_num) {
-    if (!stats_on_ || layer < 1 || layer >= (int64_t) routers_.size()) return;
+    if (!stats_on_) return;
+    // H-66: a window starts where the layer index stops rising (this PC's layer 0 may not reach the pool at all)
+    // and the window before it ended there: count it and print every 100 (the last layer here need not be the model's)
+    if (layer <= st_prev_) {
+        gen_.fetch_add(1, std::memory_order_relaxed);
+        if (st_prev_ < (1 << 30) && (++st_windows_ % 100) == 0) stats_print();
+    }
+    st_prev_ = layer;
+    // this PC's first layer has no earlier layer here to predict it from, and a layer without a router none at all
+    if (layer < 1 || layer >= (int64_t) routers_.size() || layer <= st_first_ || routers_[(size_t) layer].empty()) return;
     ++st_layers_;
     if (pstamp_[(size_t) layer].load(std::memory_order_acquire) != gen_.load(std::memory_order_relaxed) + 1) {
         ++st_nopred_;
@@ -2329,7 +2350,10 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
         st_hit_[s] += hit;
         st_pred_[s] += np;
     }
-    if (layer == (int64_t) routers_.size() - 1 && (++st_windows_ % 100) == 0) {
+}
+
+void RouterLookahead::stats_print() {
+    {
         const uint64_t scored = st_layers_ - st_nopred_;
         std::fprintf(stderr, "strata lookahead stats: %llu windows, %llu layers scored, %llu without a prediction (%.1f%%); "
                      "%.2f actual non-resident experts/layer;",
@@ -2381,6 +2405,7 @@ void RouterLookahead::run() {
         const int64_t layer0 = layer;
         for (int dj = 0; dj < depth_ && layer0 + dj < (int64_t) routers_.size(); ++dj) {
         layer = layer0 + dj;
+        if (routers_[(size_t) layer].empty()) break;   // H-66: past this PC's layers
         want.clear();
         // The router dot is AVX2 (kq_avx2.cpp); a CPU without AVX2 (the experimental older-CPU builds) takes the AVX1
         // one (kq_avx1.cpp) or, without AVX, the same sums in plain C++.  From the Strata_Dirigo fork (rwkeyes): an
@@ -2465,6 +2490,146 @@ void RouterLookahead::run() {
             busy_ = false;
         }
     }
+}
+
+// ---- H-66: CpuPrefetch -------------------------------------------------------------------------------------------
+
+bool CpuPrefetch::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k, int mode,
+                        const ExpertSource* src, std::string& err) {
+#if !(defined(__x86_64__) || defined(_M_X64))
+    (void) routers; (void) n_embd; (void) n_expert; (void) k; (void) mode; (void) src;
+    err = "CpuPrefetch: x86 only";
+    return false;
+#else
+    if (src == nullptr) { err = "CpuPrefetch: no expert source"; return false; }
+    if (!strata::kernels::cpu::cpu_avx2_ok()) { err = "CpuPrefetch: needs AVX2 (the router rows)"; return false; }
+    if (n_expert % kRowsPerUnit != 0 || n_embd % 8 != 0) { err = "CpuPrefetch: an unexpected router shape"; return false; }
+    bool any = false;
+    for (const auto& r : routers) {
+        if (!r.empty() && r.size() != (size_t) (n_embd * n_expert)) { err = "CpuPrefetch: a router of another shape"; return false; }
+        any |= !r.empty();
+    }
+    if (!any) { err = "CpuPrefetch: no router on this PC"; return false; }
+    routers_ = std::move(routers);
+    n_embd_ = n_embd;
+    n_expert_ = n_expert;
+    k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
+    mode_ = mode;
+    units_ = (int) (n_expert / kRowsPerUnit);
+    src_ = src;
+    for (Buf& b : buf_) b.logits.assign((size_t) (kMaxTok * n_expert), 0.0f);
+    return true;
+#endif
+}
+
+void CpuPrefetch::hint(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res, double ms_run) {
+    const uint64_t g = gen_.load(std::memory_order_relaxed);
+    if (g > 0) {   // how far the previous hint got before this layer's batch made it moot
+        Buf& p = buf_[g & 1];
+        if (p.ready.load(std::memory_order_acquire) == g) {
+            ++ready_before_;
+            const uint32_t nc = p.n_chunks.load(std::memory_order_relaxed);
+            chunks_sum_ += nc;
+            chunks_done_sum_ += std::min(nc, p.chunk_next.load(std::memory_order_relaxed));
+            items_sum_ += (uint64_t) p.n_items;
+        }
+    }
+    ++hints_;
+    if (hints_ - hints_last_ >= 6000) {
+        const double n = (double) (hints_ - hints_last_);
+        std::fprintf(stderr, "strata cpu prefetch (H-66, mode %d): %llu hints, %.1f%% predicted before the next batch "
+                             "(%.2f experts/layer), %.1f%% of their bytes %s; CPU experts %.3f ms/layer\n",
+                     mode_, (unsigned long long) hints_, 100.0 * (double) ready_before_ / (double) hints_,
+                     ready_before_ ? (double) items_sum_ / (double) ready_before_ : 0.0,
+                     chunks_sum_ ? 100.0 * (double) chunks_done_sum_ / (double) chunks_sum_ : 0.0,
+                     mode_ == 1 ? "prefetched" : "would be prefetched (mode 2: not)", (ms_run - ms_run_last_) / n);
+        hints_last_ = hints_;
+        ms_run_last_ = ms_run;
+    }
+    const int64_t next = layer + 1;
+    if (next >= (int64_t) routers_.size() || routers_[(size_t) next].empty() || x == nullptr || n_tok <= 0) return;
+    const uint64_t ng = g + 1;
+    Buf& b = buf_[ng & 1];
+    // a worker still on the hint two back (same buffer) at worst spoils this one
+    b.ready.store(0, std::memory_order_relaxed);
+    b.layer = next;
+    b.nt = (int) std::min<int64_t>(n_tok, kMaxTok);
+    b.x = x;
+    b.host_res = host_res;
+    b.rows_next.store(0, std::memory_order_relaxed);
+    b.rows_done.store(0, std::memory_order_relaxed);
+    b.chunk_next.store(0, std::memory_order_relaxed);
+    b.n_chunks.store(0, std::memory_order_relaxed);
+    gen_.store(ng, std::memory_order_release);
+}
+
+void CpuPrefetch::work(int worker) {
+    (void) worker;
+#if defined(__x86_64__) || defined(_M_X64)
+    const uint64_t g = gen_.load(std::memory_order_acquire);
+    if (g == 0) return;
+    Buf& b = buf_[g & 1];
+    if (b.rows_next.load(std::memory_order_relaxed) < (uint32_t) units_) {
+        const uint32_t u = b.rows_next.fetch_add(1, std::memory_order_relaxed);
+        if (u < (uint32_t) units_) {
+            const int64_t r0 = (int64_t) u * kRowsPerUnit;
+            float out[kMaxTok * kRowsPerUnit];
+            const int nt = b.nt;
+            strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) b.layer].data() + (size_t) (r0 * n_embd_),
+                                                      kRowsPerUnit, (int) n_embd_, b.x, nt, out);
+            for (int t = 0; t < nt; ++t)
+                std::memcpy(b.logits.data() + (size_t) (t * n_expert_ + r0), out + (size_t) t * kRowsPerUnit,
+                            sizeof(float) * kRowsPerUnit);
+            if (b.rows_done.fetch_add(1, std::memory_order_acq_rel) + 1 == (uint32_t) units_ &&
+                gen_.load(std::memory_order_relaxed) == g)
+                select(g);
+            return;
+        }
+    }
+    if (mode_ != 1 || b.ready.load(std::memory_order_acquire) != g) return;
+    const uint32_t c = b.chunk_next.fetch_add(1, std::memory_order_relaxed);
+    if (c >= b.n_chunks.load(std::memory_order_relaxed)) return;
+    int i = 0;
+    while (i + 1 < b.n_items && b.item_chunk0[i + 1] <= c) ++i;
+    const uint8_t* p = b.item[i];
+    if (p == nullptr) return;
+    const uint64_t off = (uint64_t) (c - b.item_chunk0[i]) * kChunk;
+    const uint64_t end = std::min<uint64_t>(off + kChunk, b.item_bytes[i]);
+    for (uint64_t o = off; o < end; o += 64) _mm_prefetch((const char*) p + o, _MM_HINT_T1);
+#endif
+}
+
+void CpuPrefetch::select(uint64_t g) {
+    Buf& b = buf_[g & 1];
+    const int64_t layer = b.layer;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::vector<int32_t> order((size_t) n_expert_);
+    int n = 0;
+    uint32_t chunks = 0;
+    for (int t = 0; t < b.nt && n < kMaxItems; ++t) {
+        const float* lt = b.logits.data() + (size_t) (t * n_expert_);
+        for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
+        std::partial_sort(order.begin(), order.begin() + k_, order.end(),
+                          [&](int32_t a, int32_t c) { return lt[(size_t) a] > lt[(size_t) c]; });
+        for (int j = 0; j < k_ && n < kMaxItems; ++j) {
+            const int32_t e = order[(size_t) j];
+            if (b.host_res != nullptr && b.host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // the GPU's
+            const uint8_t* p = src_->peek(layer, e);
+            if (p == nullptr) continue;
+            bool dup = false;
+            for (int q = 0; q < n && !dup; ++q) dup = b.item[q] == p;
+            if (dup) continue;
+            b.item[n] = p;
+            b.item_bytes[n] = lay.blob_bytes(layer);
+            b.item_chunk0[n] = chunks;
+            chunks += (uint32_t) ((b.item_bytes[n] + kChunk - 1) / kChunk);
+            ++n;
+        }
+    }
+    b.item_chunk0[n] = chunks;
+    b.n_items = n;
+    b.n_chunks.store(chunks, std::memory_order_relaxed);
+    b.ready.store(g, std::memory_order_release);
 }
 
 void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
@@ -3967,6 +4132,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++jb.nt;
             ++d.multi_entries;
         }
+    // H-66, STRATA_CPU_PREFETCH=3 (a measurement, slower overall): the dispatch thread reads this layer's CPU blobs into
+    // the caches before the batch, so `ms_run` is the kernels' time with their data already cached - the ceiling of
+    // any prefetch of the CPU experts
+    if (d.cpu_prefetch != nullptr && d.cpu_prefetch->mode() == 3) {
+        uint8_t s = 0;
+        for (int64_t j = 0; j < njobs; ++j) {
+            const uint8_t* p = d.jobs_multi[(size_t) j].blob;
+            const uint64_t nb = lay.blob_bytes(d.layers);
+            if (p != nullptr)
+                for (uint64_t o = 0; o < nb; o += 64) s ^= *(const volatile uint8_t*) (p + o);
+        }
+        d.touch_sink ^= s;
+    }
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
@@ -4002,6 +4180,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
     d.multi_misses += njobs;
+    // H-66: the parked workers predict the next layer's CPU experts from this input and prefetch them
+    if (d.cpu_prefetch != nullptr) d.cpu_prefetch->hint(d.layers, x_f, n_tok, d.host_res, d.ms_run);
     ++d.layers;
     d.experts += n_tok * k;
 }
@@ -4792,6 +4972,13 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
+    return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+}
+
+const uint8_t* ArenaExpertSource::peek(int64_t layer, int64_t expert) const {
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    const int64_t idx = layer * n_expert_ + expert;
+    if (idx < 0 || idx >= blobs_) return nullptr;
     return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
 }
 

@@ -5712,14 +5712,20 @@ int main(int argc, char** argv) {
         [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::atoi(v) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
+        int64_t n_routers = 0;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {
             const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            // H-66 (two PCs / a layer split): the layers this PC or stage does not hold keep no router; the look-ahead
+            // skips them instead of turning itself off
+            if (w == nullptr && (net_first || net_second || multi_gpu)) continue;
             ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;
+            ++n_routers;
             routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
             ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
+        ok = ok && n_routers > 0;
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, srcp, err, fs_ahead || la_stats)) {
             drive.d.lookahead = &lookahead;
@@ -5735,6 +5741,38 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
                          ok ? err.c_str() : "the routers are not BF16 in the arena");
             err.clear();
+        }
+    }
+    // H-66, STRATA_CPU_PREFETCH=1 (opt-in; 2 = predict only, the A/B arm): the pool's parked workers predict the next
+    // layer's CPU experts with its router and prefetch them into the caches (CpuPrefetch).  Hints only: the output is
+    // unchanged.  The prefetcher lives as long as the process (the pool's workers may call it until they stop).
+    if (const char* pv = std::getenv("STRATA_CPU_PREFETCH"); pv != nullptr && std::atoi(pv) > 0 && srcp != nullptr &&
+                                                             !o.no_pool) {
+        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+        bool ok = true;
+        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+            if (l < net_lo || (net_hi >= 0 && l >= net_hi)) continue;   // the other PC's layers
+            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            if (w == nullptr) continue;
+            ok = w->kind == strata::core::WeightKind::Bf16InF32 && w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+            if (!ok) break;
+            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+            ok = cudaMemcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        const char* kv = std::getenv("STRATA_CPU_PREFETCH_K");
+        auto* cp = new strata::core::CpuPrefetch;
+        if (ok && cp->start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, std::atoi(pv), srcp, err)) {
+            drive.d.cpu_prefetch = cp;
+            pool.set_idle(&strata::core::CpuPrefetch::idle, cp);
+            std::fprintf(stderr, "strata generate: STRATA_CPU_PREFETCH=%d: the pool's idle workers %s the next layer's "
+                                 "CPU experts (top %d)\n", std::atoi(pv),
+                         std::atoi(pv) == 1 ? "predict and prefetch" : "predict (no prefetch)", kv ? std::atoi(kv) : 10);
+        } else {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata generate: STRATA_CPU_PREFETCH off (%s)\n",
+                         ok ? err.c_str() : "the routers are not BF16 in the arena");
+            err.clear();
+            delete cp;
         }
     }
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on

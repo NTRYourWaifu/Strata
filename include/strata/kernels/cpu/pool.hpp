@@ -218,7 +218,18 @@ public:
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};
 
+    /// H-66 (STRATA_CPU_PREFETCH): a parked worker calls `fn(ctx, worker)` between its pauses, so the idle time between
+    /// two layers' batches can prefetch the next layer's predicted experts.  `fn` must return within microseconds (one
+    /// unit of work) and must not touch the batch state; nullptr (the default) leaves the park loop as it was.
+    using IdleFn = void (*)(void* ctx, int worker);
+    void set_idle(IdleFn fn, void* ctx) {
+        idle_ctx_.store(ctx, std::memory_order_relaxed);
+        idle_fn_.store(fn, std::memory_order_release);
+    }
+
 private:
+    alignas(64) std::atomic<IdleFn> idle_fn_{nullptr};
+    std::atomic<void*> idle_ctx_{nullptr};
     int phase_tasks(int64_t rows) const;
     int tasks_ = 0;
     void worker(int id);
