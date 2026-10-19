@@ -43,6 +43,13 @@ enum class NetOp : uint32_t {
     Restore = 8,   ///< put the checkpoint at L tokens back (int64 L)
     Prefill = 9,   ///< a batched prompt chunk: NetPrefillHead, int32 tokens[T], float rows[T x hc*n_embd]
     Cvec = 10,     ///< the request's control vector switch (int32 0|1) for this PC's layers
+    // H-69, the disk cache (--disk-cache DIR on both PCs; a second PC without it, or an older one, answers an error and
+    // the first PC goes on without its disk cache).  Each PC writes its own layers' part of a snapshot to its own disk.
+    DiskSave = 11,     ///< NetDiskHead, int64 ck[n_ck], int32 ids[n_ids]: this PC's part of snapshot `key` (reply: u64 bytes)
+    DiskLoad = 12,     ///< NetDiskHead (n_ck = 0): read and check snapshot `key` of L tokens, kept until Apply / Discard
+    DiskApply = 13,    ///< the snapshot DiskLoad read becomes this PC's session (its checkpoints too)
+    DiskDiscard = 14,  ///< the snapshot DiskLoad read is dropped
+    DiskDrop = 15,     ///< int32 n, then n keys of 16 chars: delete those snapshots' files
     Reply = 100,
 };
 
@@ -78,6 +85,15 @@ struct NetPrefillHead {
     int32_t ple_prev[2] = {-1, -1};   ///< the two tokens before pos0, oldest first (-1: none)
     int32_t want_R = 0;
     int32_t pad = 0;
+};
+
+/// The fixed head of the disk cache's messages (H-69).
+struct NetDiskHead {
+    char key[16] = {};       ///< the snapshot's name (16 hex digits; the files are <key>.<ext> in --disk-cache DIR)
+    int64_t L = 0;           ///< the snapshot's tokens: its K/V and running state are at L
+    int64_t live_from = -1;  ///< DiskSave: -1 the live session's running state; else the checkpoint at that length
+    int32_t n_ck = 0;        ///< DiskSave: the checkpoints the file keeps (their lengths follow)
+    int32_t n_ids = 0;       ///< DiskSave: the token ids follow (the file's identity of the prefix)
 };
 
 /// A blocking TCP connection (Winsock on Windows, BSD sockets elsewhere), TCP_NODELAY.
@@ -127,6 +143,10 @@ public:
     double ms_prefill = 0;          ///< the prompt chunks' round trips, summed
     int64_t prefill_chunks = 0;
     bool logits(int t, float* host, std::string& err);
+    /// H-69: a disk cache message sent without waiting (the other PC reads or writes its part while this PC does its
+    /// own), and its reply read later.  Nothing else may use the link between the two.
+    bool disk_send(NetOp op, const void* p, size_t n, std::string& err);
+    bool disk_reply(std::string& err, std::vector<uint8_t>* payload = nullptr) { return reply(err, payload); }
     int64_t vocab() const { return vocab_; }
     /// The draft layer (MTP) runs on the first PC from the last layer's residual rows: when `R_dev` is set, every
     /// window's reply carries its T final residual rows (R_floats each = hc * n_embd) and run() puts them here (device).

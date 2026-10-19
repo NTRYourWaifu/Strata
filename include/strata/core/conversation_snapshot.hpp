@@ -34,6 +34,12 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// H-69, a disk read without a host copy: the layer's authoritative K/V as a streamed sink (the restore's mirror of
+// conversation_kv_source), and what conversation_kv_restore does after its copies (the residency: the streaming map
+// reset, the draft ring refilled) once every byte was written.  Caller synchronizes the device first.
+bool conversation_kv_sink(SessionKvSink& sink, const QsaState& state, const ModelGeometry& g, int64_t upto,
+                          bool include_index, std::string& error);
+bool conversation_kv_sink_done(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -112,5 +118,27 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+
+// H-69 (disk cache across a layer split and two PCs): the disk-save sources with `draft == nullptr` (a stage without
+// the draft layer) and, with `live_from`, a checkpoint's running state as the file's live state (the K/V up to its
+// length is still the session's: the system prompt's root while the session holds a longer conversation).
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                   const ConversationCheckpoint* live_from = nullptr);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
+// H-69, the streamed disk read (session_file_read_streamed): the K/V bytes a snapshot of `upto` tokens holds (the RAM
+// it does not need); the sinks for a parsed file (`meta`: its kv empty), checked like conversation_snapshot_validate
+// but for the K/V; and, once every sink was written, the restore of the rest (residency, the live running state).
+bool conversation_snapshot_kv_bytes(const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                    int64_t upto, uint64_t& bytes, std::string& error);
+bool conversation_snapshot_sinks(std::vector<SessionKvSink>& sinks, const SavedConversation& meta,
+                                 const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                 std::string& error);
+ConversationRestore conversation_snapshot_restore_streamed(const SavedConversation& meta, SessionState& session,
+                                                           const ModelGeometry& g, const QsaState* draft,
+                                                           std::string& error);
 
 } // namespace strata::core

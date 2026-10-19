@@ -364,6 +364,11 @@ bool NetLink::restore(int64_t L, std::string& err) {
     return reply(err);
 }
 
+bool NetLink::disk_send(NetOp op, const void* p, size_t n, std::string& err) {
+    if (!c_.send_msg(op, p, n)) { err = "net stage: send failed"; return false; }
+    return true;
+}
+
 NetPipe::~NetPipe() {
     if (th_.joinable()) {
         if (done_.load()) th_.join();

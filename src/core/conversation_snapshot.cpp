@@ -210,6 +210,32 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    return conversation_kv_sink_done(st, g, upto, error);
+}
+
+bool conversation_kv_sink(SessionKvSink& out, const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
+                          std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    SessionKvSink s;
+    s.format = l.format; s.cells = l.cells; s.heads = g.n_head_kv; s.head_dim = g.head_dim;
+    s.page_size = l.page_size; s.pooled_rows = l.pooled_rows; s.idx_dim = g.idx_key_dim;
+    s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < dst.size(); ++i)
+        if (s.sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    const auto sizes = s.sizes;
+    auto why = std::make_shared<std::string>();
+    s.write = [dst, sizes, why](size_t part, size_t offset, const void* src, size_t n) {
+        if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V write out of range"; return false; }
+        return transfer(static_cast<uint8_t*>(dst[part]) + offset, src, n, *why);
+    };
+    s.error = [why] { return *why; };
+    out = std::move(s);
+    return true;
+}
+
+bool conversation_kv_sink_done(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);

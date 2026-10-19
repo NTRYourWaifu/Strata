@@ -1039,6 +1039,10 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # "strata_disk": false (H-69) - this request neither reads the engine's disk cache (--disk-cache) nor writes to it
+        # (a measurement's full read, a probe).  Absent = as before.
+        if sampling.get("strata_disk") is False:
+            keys += " disk=0"
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")

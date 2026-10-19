@@ -61,6 +61,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/net_stage.hpp"
+#include "strata/core/disk_cache.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
@@ -628,6 +629,17 @@ struct Options {
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
+    /// --serve, H-69 (opt-in): the disk cache of conversation snapshots (disk_cache.hpp) in this folder.  A turn's end
+    /// (the reply has no tool call), the system prompt's root and (--disk-cache-switch) a long conversation another
+    /// one replaces are written there; a request that starts with one reads it back instead of its prompt.  Works on
+    /// one GPU, a local layer split and a split across two PCs (each PC keeps its own layers' part in its own folder).
+    std::string disk_cache;
+    double disk_cache_gib = 30;               ///< --disk-cache-gib: this PC's files at most (the oldest go first)
+    int64_t disk_cache_min_tokens = 2048;     ///< --disk-cache-min-tokens: shorter conversations are not written
+    int64_t disk_cache_min_gain = 1024;       ///< --disk-cache-min-gain: read back only when it saves this many tokens
+    int64_t disk_cache_skip_token = 248058;   ///< --disk-cache-skip-token: a reply with it (<tool_call>) is mid-turn
+    int disk_cache_switch = 1;                ///< --disk-cache-switch 0|1: write the conversation another one replaces
+    int64_t disk_cache_min_free_mib = 128;    ///< --disk-cache-min-free-mib: the RAM a read back must leave free (10-19: the second PC has ~0.3 GB)
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -1773,6 +1785,33 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
+// H-69: the disk cache's RAM preflight for reading back `need` bytes (the snapshot's running state and checkpoints; its
+// K/V goes straight to the GPU).  1: admitted; 2: admitted once the session's own checkpoints (`held` bytes, which the
+// read replaces) are counted free - the caller drops them first; 0: refused, `why` says so.  Admitted when the RAM
+// left free stays above `floor` or, on Windows, when the commit stays 512 MiB clear: these PCs run with little RAM
+// free (10-19: 75 MiB on the second PC after a 35K-token prompt) and a short allocation only pages clean mapped
+// experts or standby pages out, while past the commit limit the engine ends with no message (#1607).
+static int disk_read_admit(uint64_t need, uint64_t held, uint64_t floor, std::string& why) {
+    strata::core::detail::HostMemory hm;
+    const bool known = strata::core::detail::host_available_memory(hm);
+    constexpr uint64_t kCommitClear = 512ull << 20;
+    auto fits = [&](uint64_t extra) {
+        if (!known) return false;
+        const uint64_t ram = hm.available + extra;
+        if (ram >= floor && need <= ram - floor) return true;
+        if (hm.commit == ~uint64_t{0}) return false;
+        const uint64_t commit = hm.commit + extra;
+        return commit >= kCommitClear && need <= commit - kCommitClear;
+    };
+    if (fits(0)) return 1;
+    if (held > 0 && fits(held)) return 2;
+    why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB; " +
+          (known ? std::to_string(hm.available >> 20) : std::string("?")) + " MiB free, commit " +
+          (known && hm.commit != ~uint64_t{0} ? std::to_string(hm.commit >> 20) + " MiB" : std::string("?")) + ", " +
+          std::to_string(held >> 20) + " MiB in checkpoints)";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -2054,6 +2093,13 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+        else if (a == "--disk-cache") o.disk_cache = next("--disk-cache");
+        else if (a == "--disk-cache-gib") o.disk_cache_gib = std::max(0.0, std::atof(next("--disk-cache-gib")));
+        else if (a == "--disk-cache-min-tokens") o.disk_cache_min_tokens = std::max(1LL, std::atoll(next("--disk-cache-min-tokens")));
+        else if (a == "--disk-cache-min-gain") o.disk_cache_min_gain = std::max(1LL, std::atoll(next("--disk-cache-min-gain")));
+        else if (a == "--disk-cache-skip-token") o.disk_cache_skip_token = std::atoll(next("--disk-cache-skip-token"));
+        else if (a == "--disk-cache-switch") o.disk_cache_switch = std::atoi(next("--disk-cache-switch")) != 0;
+        else if (a == "--disk-cache-min-free-mib") o.disk_cache_min_free_mib = std::max(0LL, std::atoll(next("--disk-cache-min-free-mib")));
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -8438,6 +8484,343 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // ---- H-69: the disk cache (--disk-cache DIR, disk_cache.hpp).  A snapshot is one session file per GPU stage
+        // of this PC (<key>.s0 with stage 0's layers, <key>.s1 ...; the draft layer's K/V with the stage the drafter
+        // runs on) and, across two PCs, the other PC's <key>.net in its own folder.  It is written between requests -
+        // after a turn's last reply (no tool call in it), for a new system prompt's root, and (--disk-cache-switch)
+        // for a long conversation that another one is about to replace - and read back at the start of a request
+        // that it gives at least --disk-cache-min-gain more tokens than the RAM cache does.
+        strata::core::DiskCache dcache;
+        bool dc_live_disk = false;   // the request that left `live` let the cache write it (no disk=0)
+        std::string dc_layout;
+        strata::core::SessionFileIdentity dc_id;
+        const size_t dc_n = stages.size();   // the stages after stage 0 on this PC
+        auto dc_ss = [&](size_t k) -> strata::core::SessionState& { return k == 0 ? ss : stages[k - 1]->ss; };
+        auto dc_draft = [&](size_t k) -> const strata::core::QsaState* {   // the drafter: on the last stage of this PC
+            return use_mtp && k == dc_n ? &mtp.kv_state() : nullptr;
+        };
+        if (!o.disk_cache.empty() && !net_second) {
+            const char* why = o.prompt_cache <= 0 ? "it needs --prompt-cache > 0" : o.batch > 0 ? "not with --batch"
+                            : o.peer_device >= 1 ? "not with --peer-device" : o.vision ? "not with --vision"
+                            : o.kv_grow ? "not with --kv-grow" : nullptr;
+            std::string de;
+            if (why == nullptr && !session_identity(dc_id, de, [] { strata::core::progress_beat(); })) why = de.c_str();
+            if (why == nullptr && !dcache.open(o.disk_cache, (uint64_t) (o.disk_cache_gib * 1073741824.0), de)) why = de.c_str();
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: disk cache: off (%s)\n", why);
+                dcache = strata::core::DiskCache{};
+            } else {
+                dc_layout = std::to_string(ss.layer_lo) + "-" + std::to_string(ss.layer_hi);
+                for (auto& st : stages) dc_layout += "," + std::to_string(st->ss.layer_lo) + "-" + std::to_string(st->ss.layer_hi);
+                if (net_first) dc_layout += ",net" + std::to_string(o.net_split);
+                size_t usable = 0;
+                for (const auto& s : dcache.entries())
+                    usable += s.model == dc_id.model && s.config == dc_id.config && s.layout == dc_layout ? 1 : 0;
+                std::fprintf(stderr, "strata serve: disk cache: %s, %zu snapshots (%zu for this model and split), %.1f of "
+                                     "%.1f GiB%s\n", o.disk_cache.c_str(), dcache.entries().size(), usable,
+                             (double) dcache.dir_bytes() / 1073741824.0, o.disk_cache_gib,
+                             net_first ? "; the other PC keeps its layers' part in its own folder" : "");
+            }
+        }
+        auto dc_off = [&](const std::string& why) {
+            std::fprintf(stderr, "strata serve: disk cache: off from now on (%s)\n", why.c_str());
+            dcache = strata::core::DiskCache{};
+        };
+        auto dc_drop_remote = [&](const std::vector<std::string>& keys) {
+            if (!net_link || keys.empty()) return;
+            std::vector<uint8_t> p(4 + keys.size() * 16);
+            const int32_t nk = (int32_t) keys.size();
+            std::memcpy(p.data(), &nk, 4);
+            for (size_t i = 0; i < keys.size(); ++i) std::memcpy(p.data() + 4 + i * 16, keys[i].data(), 16);
+            std::string e;
+            if (!net_link->disk_send(strata::core::NetOp::DiskDrop, p.data(), p.size(), e) || !net_link->disk_reply(e))
+                std::fprintf(stderr, "strata serve: disk cache: the other PC did not drop %zu snapshot%s: %s\n", keys.size(),
+                             keys.size() == 1 ? "" : "s", e.c_str());
+        };
+        // the deepest checkpoint short of `ids` (a prefix of it), or null
+        auto dc_deepest = [&](const std::vector<int32_t>& ids) -> const ConvCheckpoint* {
+            const ConvCheckpoint* best = nullptr;
+            for (const ConvCheckpoint& c : checks)
+                if (c.ids.size() < ids.size() && (best == nullptr || c.ids.size() > best->ids.size()) && c.imgs.empty() &&
+                    std::equal(c.ids.begin(), c.ids.end(), ids.begin()))
+                    best = &c;
+            return best;
+        };
+        // Writes a snapshot of `sids` (a prefix of the session's tokens, its K/V up to there): its running state is the
+        // live session's (`from` null: sids is `live`) or checkpoint `from`'s; the file keeps checkpoint `keep` too.
+        auto dc_save = [&](int32_t kind, const std::vector<int32_t>& sids, const ConvCheckpoint* from,
+                           const ConvCheckpoint* keep) {
+            if (!dcache.on() || sids.empty()) return;
+            if (const int f = dcache.find(sids, cvec_cached); f >= 0) { dcache.touch((size_t) f); return; }
+            if ((from != nullptr && from->stage_parts.size() != dc_n) || (keep != nullptr && keep->stage_parts.size() != dc_n))
+                return;   // a checkpoint without every stage's part: not one this cache can write
+            const auto t0 = Clock::now();
+            const std::string key = strata::core::disk_snapshot_key(sids, cvec_cached);
+            const int64_t L = (int64_t) sids.size();
+            std::string e;
+            bool remote = false;
+            if (net_link) {   // the other PC writes its part while this one writes its own
+                strata::core::NetDiskHead h;
+                std::memcpy(h.key, key.data(), 16);
+                h.L = L;
+                h.live_from = from != nullptr ? L : -1;
+                h.n_ck = keep != nullptr ? 1 : 0;
+                h.n_ids = (int32_t) L;
+                std::vector<uint8_t> p(sizeof h + (size_t) h.n_ck * 8 + sids.size() * 4);
+                std::memcpy(p.data(), &h, sizeof h);
+                if (keep != nullptr) {
+                    const int64_t kl = (int64_t) keep->ids.size();
+                    std::memcpy(p.data() + sizeof h, &kl, 8);
+                }
+                std::memcpy(p.data() + sizeof h + (size_t) h.n_ck * 8, sids.data(), sids.size() * 4);
+                if (!net_link->disk_send(strata::core::NetOp::DiskSave, p.data(), p.size(), e)) { dc_off(e); return; }
+                remote = true;
+            }
+            bool ok = true;
+            uint64_t bytes = 0;
+            for (size_t k = 0; k <= dc_n && ok; ++k) {
+                std::optional<strata::core::OnDevice> on;
+                if (k > 0) on.emplace(stages[k - 1]->dev);
+                std::vector<ConvCheckpoint> ck;
+                if (keep != nullptr) {
+                    if (k == 0) {
+                        ConvCheckpoint c0;   // stage 0's part: the checkpoint without the later stages' parts
+                        c0.ids = keep->ids; c0.imgs = keep->imgs; c0.gdn = keep->gdn; c0.ple = keep->ple;
+                        c0.tails = keep->tails; c0.dead = keep->dead; c0.block_pos = keep->block_pos;
+                        ck.push_back(std::move(c0));
+                    } else {
+                        ck.push_back(keep->stage_parts[k - 1]);
+                        ck.back().ids = keep->ids;
+                    }
+                }
+                const ConvCheckpoint* lf = from == nullptr ? nullptr : k == 0 ? from : &from->stage_parts[k - 1];
+                const std::vector<ImgKey> no_imgs;
+                const strata::core::ConversationView view{sids, no_imgs, ck, cvec_cached};
+                strata::core::SavedConversation meta;
+                std::vector<strata::core::SessionKvSource> src;
+                strata::core::SessionWriteOptions wo;
+                wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                wo.durable = false;   // a cache: a file lost to a power cut costs one prompt read, the flushes seconds
+                wo.unbuffered = true;   // past the OS file cache: little RAM is free (conversation_file.cpp)
+                wo.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
+                wo.phase = [](const char*, uint64_t b) { strata::core::progress_allow(strata::core::session_phase_limit_s(b)); };
+                strata::core::SessionStatus st;
+                size_t b = 0;
+                try {
+                    ok = cudaDeviceSynchronize() == cudaSuccess &&
+                         strata::core::conversation_snapshot_sources(meta, src, view, dc_ss(k), g, dc_draft(k), e, lf) &&
+                         strata::core::session_file_write(dcache.path(key, "s" + std::to_string(k)), meta, src, dc_id, b, e,
+                                                          wo, &st);
+                } catch (const std::bad_alloc&) {
+                    ok = false;
+                    e = "out of memory";
+                }
+                strata::core::progress_allow(0);
+                bytes += b;
+            }
+            uint64_t rbytes = 0;
+            bool rok = true;
+            std::string re;
+            if (remote) {
+                std::vector<uint8_t> rp;
+                strata::core::progress_allow(120);   // the other PC writes its part (its own watchdog guards it)
+                rok = net_link->disk_reply(re, &rp);
+                strata::core::progress_allow(0);
+                if (rok && rp.size() >= 8) std::memcpy(&rbytes, rp.data(), 8);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            if (!ok || !rok) {
+                strata::core::disk_drop_key(dcache.dir(), key);
+                if (remote && rok) dc_drop_remote({key});
+                std::fprintf(stderr, "strata serve: disk cache: writing %s (%s, %lld tokens) failed: %s\n", key.c_str(),
+                             strata::core::disk_kind_name(kind), (long long) L, !ok ? e.c_str() : re.c_str());
+                // the other PC keeps no disk cache (an older engine, or no --disk-cache there): nothing can be read back
+                if (!rok && (re.find("unknown message") != std::string::npos || re.find("no --disk-cache") != std::string::npos))
+                    dc_off(re);
+                return;
+            }
+            strata::core::DiskSnapshot s;
+            s.key = key;
+            s.model = dc_id.model;
+            s.config = dc_id.config;
+            s.layout = dc_layout;
+            s.kind = kind;
+            s.cvec = cvec_cached;
+            s.ids = sids;
+            if (keep != nullptr) s.cks.push_back((int64_t) keep->ids.size());
+            s.bytes = bytes;
+            s.remote_bytes = rbytes;
+            s.used = strata::core::disk_now_ms();
+            if (!dcache.put(std::move(s), e)) {
+                std::fprintf(stderr, "strata serve: %s\n", e.c_str());
+                strata::core::disk_drop_key(dcache.dir(), key);
+                if (remote) dc_drop_remote({key});
+                return;
+            }
+            const auto gone = dcache.trim(key);
+            dc_drop_remote(gone);
+            std::fprintf(stderr, "strata serve: disk cache: wrote %s (%s, %lld tokens%s) in %.0f ms: %.1f MB here%s; %zu "
+                                 "snapshots, %.2f GiB here%s\n", key.c_str(), strata::core::disk_kind_name(kind),
+                         (long long) L, keep != nullptr ? (", checkpoint at " + std::to_string(keep->ids.size())).c_str() : "",
+                         ms, (double) bytes / 1e6,
+                         remote ? (" + " + std::to_string((int64_t) (rbytes / 1000000)) + " MB on the other PC").c_str() : "",
+                         dcache.entries().size(), (double) dcache.dir_bytes() / 1073741824.0,
+                         gone.empty() ? "" : ("; " + std::to_string(gone.size()) + " old ones deleted").c_str());
+        };
+        // Reads back the snapshot that gives `rids` the most tokens, when that beats the RAM cache's `ram_resume` by
+        // --disk-cache-min-gain.  1: the session (and the other PC's) is the snapshot now, `live` and `checks` its
+        // tokens and checkpoints; 0: nothing changed, or the session was reset (read from token 0); -1: a transfer
+        // failed after the GPUs' state was touched (the caller ends the engine, as for a parked conversation).
+        auto dc_restore = [&](const std::vector<int64_t>& rids, bool want_cv, int64_t ram_resume) -> int {
+            if (!dcache.on()) return 0;
+            int64_t cand = 0;
+            const int bi = dcache.best(rids, want_cv, dc_id.model, dc_id.config, dc_layout, cand);
+            if (bi < 0 || cand < ram_resume + o.disk_cache_min_gain) return 0;
+            const strata::core::DiskSnapshot snap = dcache.at((size_t) bi);
+            const auto t0 = Clock::now();
+            std::string e;
+            bool remote = false;
+            if (net_link) {   // the other PC reads its part straight into its GPU while this one does
+                strata::core::NetDiskHead h;
+                std::memcpy(h.key, snap.key.data(), 16);
+                h.L = (int64_t) snap.ids.size();
+                if (!net_link->disk_send(strata::core::NetOp::DiskLoad, &h, sizeof h, e)) { dc_off(e); return 0; }
+                remote = true;
+            }
+            // The K/V goes from the file's read block straight to the GPU (no host copy: the resident RAM mode leaves
+            // little free), so a file is checked whole only once it has been written over the session's K/V: from the
+            // first byte on, the session before is gone whatever happens (a failure reads the prompt from token 0).
+            bool touched_here = false;
+            auto reset = [&] {
+                conversations.take_reuse();
+                live.clear();
+                live_imgs.clear();
+                checks.clear();
+                tail_ckpt_len = -1;
+                live_ok = false;
+            };
+            std::vector<strata::core::SavedConversation> img(dc_n + 1);
+            bool ok = true, gone = false;
+            uint64_t bytes = 0;
+            for (size_t k = 0; k <= dc_n && ok; ++k) {
+                std::optional<strata::core::OnDevice> on;
+                if (k > 0) on.emplace(stages[k - 1]->dev);
+                strata::core::SessionReadLimits lim;
+                const uint64_t floor = (uint64_t) o.disk_cache_min_free_mib << 20;
+                // the resident RAM mode leaves little free: the session's checkpoints go with a read anyway, so when
+                // only their RAM makes room they go first (and the session with them)
+                lim.admit = [&, floor](uint64_t need, std::string& why) {
+                    uint64_t held = 0;
+                    for (const ConvCheckpoint& c : checks) held += c.bytes();
+                    const int a = disk_read_admit(need, held, floor, why);
+                    if (a == 2) {   // the session's checkpoints go first (and the session with them)
+                        reset();
+                        touched_here = true;
+                    }
+                    return a != 0;
+                };
+                lim.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
+                lim.unbuffered = true;
+                strata::core::SessionStatus st;
+                size_t b = 0;
+                uint64_t kvb = 0;
+                bool touched = false;
+                const strata::core::SessionKvSinks sinks = [&](const strata::core::SavedConversation& meta,
+                                                               std::vector<strata::core::SessionKvSink>& out,
+                                                               std::string& why) {
+                    if (meta.live.ids != snap.ids) { why = "its tokens differ from the index"; return false; }
+                    if (!touched_here) reset();   // committed: the K/V below overwrites the session's
+                    return strata::core::conversation_snapshot_sinks(out, meta, dc_ss(k), g, dc_draft(k), why);
+                };
+                try {
+                    ok = strata::core::conversation_session_read_limits(lim, dc_ss(k), g, dc_draft(k), (uint64_t) o.max_context,
+                                                                        (uint64_t) std::max(o.prompt_cache, 1), e) &&
+                         strata::core::conversation_snapshot_kv_bytes(dc_ss(k), g, dc_draft(k), (int64_t) snap.ids.size(),
+                                                                      kvb, e) &&
+                         strata::core::session_file_read_streamed(dcache.path(snap.key, "s" + std::to_string(k)), dc_id,
+                                                                  img[k], sinks, kvb, b, e, touched, lim, &st);
+                    if (!ok && st.error != strata::core::SessionError::memory) gone = true;
+                } catch (const std::bad_alloc&) {
+                    ok = false;
+                    e = "out of memory";
+                }
+                touched_here = touched_here || touched;
+                bytes += b;
+            }
+            const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::string re;
+            strata::core::progress_allow(remote ? 120 : 0);   // the other PC reads its part (its watchdog guards it)
+            bool rok = !remote || net_link->disk_reply(re);
+            strata::core::progress_allow(0);
+            // the other PC says so when its K/V was written over before it failed
+            const bool touched_there = remote && !rok && re.find("(overwritten)") != std::string::npos;
+            if (!ok || !rok) {
+                // tell the other PC: drop its read and, when this PC's K/V was written over, its checkpoints too
+                if (remote && rok) {
+                    const uint8_t clear = touched_here ? 1 : 0;
+                    if (!net_link->disk_send(strata::core::NetOp::DiskDiscard, &clear, 1, re) || !net_link->disk_reply(re)) {
+                        dc_off(re);
+                        reset();
+                        return 0;
+                    }
+                }
+                std::fprintf(stderr, "strata serve: disk cache: not reading %s back: %s%s\n", snap.key.c_str(),
+                             !ok ? e.c_str() : re.c_str(),
+                             touched_here || touched_there ? "; reading the prompt from token 0" : "");
+                const int at = dcache.find(snap.ids, snap.cvec);
+                if ((gone || (!rok && re.find("RAM") == std::string::npos)) && at >= 0) {   // a broken or missing part
+                    dcache.drop((size_t) at);
+                    dc_drop_remote({snap.key});
+                }
+                if (touched_here || touched_there) reset();
+                return 0;
+            }
+            // every file is whole and every K/V byte in place: the rest of the state, here and on the other PC
+            if (remote && !net_link->disk_send(strata::core::NetOp::DiskApply, nullptr, 0, re)) {
+                dc_off(re);
+                reset();
+                return 0;
+            }
+            for (size_t k = 0; k <= dc_n; ++k) {
+                std::optional<strata::core::OnDevice> on;
+                if (k > 0) on.emplace(stages[k - 1]->dev);
+                if (strata::core::conversation_snapshot_restore_streamed(img[k], dc_ss(k), g, dc_draft(k), e) !=
+                        strata::core::ConversationRestore::restored ||
+                    cudaDeviceSynchronize() != cudaSuccess) {
+                    std::printf("ERR restoring a disk cache snapshot (stage %zu): %s\n", k, e.c_str());
+                    std::fflush(stdout);
+                    return -1;
+                }
+            }
+            if (remote && !net_link->disk_reply(re)) {   // the other PC's part is half restored: read from token 0
+                std::fprintf(stderr, "strata serve: disk cache: the other PC could not restore %s (%s); reading the prompt "
+                                     "from token 0\n", snap.key.c_str(), re.c_str());
+                reset();
+                return 0;
+            }
+            live = std::move(img[0].live.ids);
+            live_imgs.clear();
+            if (dc_n == 0) {
+                checks = std::move(img[0].checkpoints);
+            } else {   // each checkpoint gets its later stages' parts back
+                strata::core::ConversationCheckpointSplit cs;
+                cs.stage0 = std::move(img[0].checkpoints);
+                for (size_t k = 1; k <= dc_n; ++k) cs.parts.push_back(std::move(img[k].checkpoints));
+                checks.clear();
+                if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+            }
+            for (ConvCheckpoint& c : checks) c.used = ++check_clock;
+            tail_ckpt_len = -1;
+            cvec_cached = snap.cvec;
+            live_ok = true;
+            if (const int at = dcache.find(snap.ids, snap.cvec); at >= 0) dcache.touch((size_t) at);
+            std::fprintf(stderr, "strata serve: disk cache: read back %s (%s, %lld tokens, gives this prompt %lld; the RAM "
+                                 "cache had %lld) in %.0f ms (files %.0f ms, %.1f MB here)\n", snap.key.c_str(),
+                         strata::core::disk_kind_name(snap.kind), (long long) snap.ids.size(), (long long) cand,
+                         (long long) ram_resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), read_ms,
+                         (double) bytes / 1e6);
+            return 1;
+        };
         // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
@@ -9595,6 +9978,9 @@ int main(int argc, char** argv) {
                 bool bye = false;
                 double net_run_ms = 0, net_commit_ms = 0;   // this PC's share of a sequence (said at the next Zero)
                 std::map<int64_t, ConvCheckpoint> net_checks;   // this PC's layers' conversation checkpoints, by length
+                // H-69: the disk cache's snapshot DiskLoad read and checked, waiting for DiskApply / DiskDiscard
+                std::optional<strata::core::SavedConversation> net_disk_img;
+                std::string net_disk_path;
                 // the batched prompt path: its buffers borrow the top of this PC's cache for a prompt and give it back
                 // (refilled) before anything else reads the cache - the first PC's lend / refill, for one participant
                 auto net_refill = [&](std::string& e) -> bool {
@@ -9942,6 +10328,183 @@ int main(int argc, char** argv) {
                             net_run_ms = net_commit_ms = 0;
                             net_run_n = 0;
                         }
+                        strata::core::net_reply_ok(nc, nullptr, 0);
+                        break;
+                    }
+                    // H-69, the disk cache: this PC's layers' part of a snapshot, in its own --disk-cache folder
+                    case strata::core::NetOp::DiskSave:
+                    case strata::core::NetOp::DiskLoad: {
+                        strata::core::NetDiskHead h;
+                        if (o.disk_cache.empty()) { strata::core::net_reply_err(nc, "no --disk-cache on the second PC"); break; }
+                        if (msg.size() < sizeof h) { strata::core::net_reply_err(nc, "a short disk cache message"); break; }
+                        std::memcpy(&h, msg.data(), sizeof h);
+                        const std::string key(h.key, 16);
+                        const bool saving = op == strata::core::NetOp::DiskSave;
+                        if (h.L < 1 || h.L > o.max_context || h.n_ck < 0 || h.n_ids < 0 ||
+                            msg.size() != sizeof h + (size_t) h.n_ck * 8 + (size_t) h.n_ids * 4 ||
+                            (saving && h.n_ids != h.L) ||
+                            !std::all_of(key.begin(), key.end(), [](char c) { return std::isxdigit((unsigned char) c) != 0; })) {
+                            strata::core::net_reply_err(nc, "a malformed disk cache message");
+                            break;
+                        }
+                        if (!pending.empty()) { strata::core::net_reply_err(nc, pending); pending.clear(); break; }
+                        if (!ver.wait_commit(e)) { strata::core::net_reply_err(nc, e); break; }
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const std::string path = o.disk_cache + "/" + key + ".net";
+                        strata::core::SessionFileIdentity id;
+                        if (!session_identity(id, e, [] { strata::core::progress_beat(); })) {
+                            strata::core::net_reply_err(nc, "the disk cache's identity: " + e);
+                            break;
+                        }
+                        if (saving && !strata::core::disk_make_dir(o.disk_cache)) {
+                            strata::core::net_reply_err(nc, "cannot create the folder " + o.disk_cache);
+                            break;
+                        }
+                        if (saving) {
+                            std::vector<int64_t> cks((size_t) h.n_ck);
+                            if (h.n_ck > 0) std::memcpy(cks.data(), msg.data() + sizeof h, (size_t) h.n_ck * 8);
+                            std::vector<int32_t> ids((size_t) h.n_ids);
+                            std::memcpy(ids.data(), msg.data() + sizeof h + (size_t) h.n_ck * 8, (size_t) h.n_ids * 4);
+                            // the checkpoints here know only their length: the first PC's ids go with them into the file
+                            std::vector<ConvCheckpoint> keep;
+                            const char* bad = nullptr;
+                            for (const int64_t c : cks) {
+                                const auto it = net_checks.find(c);
+                                if (it == net_checks.end() || c > h.L) { bad = "no checkpoint at that length"; break; }
+                                keep.push_back(it->second);
+                                keep.back().ids.assign(ids.begin(), ids.begin() + c);
+                            }
+                            const ConvCheckpoint* from = nullptr;
+                            if (bad == nullptr && h.live_from >= 0) {
+                                const auto it = net_checks.find(h.live_from);
+                                if (it == net_checks.end() || h.live_from != h.L) bad = "no checkpoint to save as the live state";
+                                else from = &it->second;
+                            }
+                            if (bad != nullptr) { strata::core::net_reply_err(nc, bad); break; }
+                            const std::vector<ImgKey> no_imgs;
+                            const strata::core::ConversationView view{ids, no_imgs, keep, true};
+                            strata::core::SavedConversation meta;
+                            std::vector<strata::core::SessionKvSource> src;
+                            size_t bytes = 0;
+                            strata::core::SessionWriteOptions wo;
+                            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                            wo.durable = false;   // a cache: a lost file costs one prompt read
+                            wo.unbuffered = true;   // past the OS file cache: this PC has little RAM free
+                            wo.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
+                            wo.phase = [](const char*, uint64_t b) { strata::core::progress_allow(strata::core::session_phase_limit_s(b)); };
+                            strata::core::SessionStatus st;
+                            if (cudaDeviceSynchronize() != cudaSuccess ||
+                                !strata::core::conversation_snapshot_sources(meta, src, view, ss, g, nullptr, e, from) ||
+                                !strata::core::session_file_write(path, meta, src, id, bytes, e, wo, &st)) {
+                                strata::core::progress_allow(0);
+                                strata::core::disk_drop_key(o.disk_cache, key);
+                                std::fprintf(stderr, "strata serve: second PC: disk cache: writing %s failed: %s\n", key.c_str(), e.c_str());
+                                strata::core::net_reply_err(nc, "writing its part failed: " + e);
+                                break;
+                            }
+                            strata::core::progress_allow(0);
+                            const auto gone = strata::core::disk_trim_dir(o.disk_cache, (uint64_t) (o.disk_cache_gib * 1073741824.0), key);
+                            const uint64_t b64 = bytes;
+                            std::fprintf(stderr, "strata serve: second PC: disk cache: wrote %s (%lld tokens, %.1f MB) in %.0f ms%s\n",
+                                         key.c_str(), (long long) h.L, (double) bytes / 1e6,
+                                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                                         gone.empty() ? "" : ("; " + std::to_string(gone.size()) + " old ones deleted").c_str());
+                            strata::core::net_reply_ok(nc, &b64, sizeof b64);
+                            break;
+                        }
+                        net_disk_img.reset();
+                        strata::core::SavedConversation image;
+                        size_t bytes = 0;
+                        bool touched = false, dropped = false;
+                        {
+                            strata::core::SessionReadLimits lim;
+                            const uint64_t floor = (uint64_t) o.disk_cache_min_free_mib << 20;
+                            // This PC runs with little RAM free (10-19: 0.3 to 0.8 GB with the experts resident).  The
+                            // checkpoints it holds go with a read anyway: when only their RAM makes room, they go first.
+                            lim.admit = [&, floor](uint64_t need, std::string& why) {
+                                uint64_t held = 0;
+                                for (const auto& [n, c] : net_checks) held += c.bytes();
+                                const int a = disk_read_admit(need, held, floor, why);
+                                if (a == 2) {   // its checkpoints go first
+                                    net_checks.clear();
+                                    dropped = true;
+                                }
+                                return a != 0;
+                            };
+                            lim.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
+                            lim.unbuffered = true;
+                            // the K/V straight into this GPU (no host copy); from its first byte the checkpoints here
+                            // describe K/V that is gone
+                            const strata::core::SessionKvSinks sinks = [&](const strata::core::SavedConversation& meta,
+                                                                           std::vector<strata::core::SessionKvSink>& out,
+                                                                           std::string& why) {
+                                if ((int64_t) meta.live.ids.size() != h.L) { why = "its part is of another length"; return false; }
+                                net_checks.clear();
+                                return strata::core::conversation_snapshot_sinks(out, meta, ss, g, nullptr, why);
+                            };
+                            strata::core::SessionStatus st;
+                            uint64_t kvb = 0;
+                            if (!strata::core::conversation_session_read_limits(lim, ss, g, nullptr, (uint64_t) o.max_context,
+                                                                                (uint64_t) std::max(o.prompt_cache, 1), e) ||
+                                !strata::core::conversation_snapshot_kv_bytes(ss, g, nullptr, h.L, kvb, e) ||
+                                !strata::core::session_file_read_streamed(path, id, image, sinks, kvb, bytes, e, touched, lim,
+                                                                          &st)) {
+                                if (touched) net_checks.clear();
+                                strata::core::net_reply_err(nc, std::string(touched || dropped ? "(overwritten) " : "") +
+                                                                    "reading its part failed: " + e);
+                                break;
+                            }
+                        }
+                        std::fprintf(stderr, "strata serve: second PC: disk cache: read %s (%lld tokens, %.1f MB) in %.0f ms\n",
+                                     key.c_str(), (long long) h.L, (double) bytes / 1e6,
+                                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                        net_disk_img = std::move(image);
+                        net_disk_path = path;
+                        strata::core::net_reply_ok(nc, nullptr, 0);
+                        break;
+                    }
+                    case strata::core::NetOp::DiskApply: {
+                        if (!net_disk_img) { strata::core::net_reply_err(nc, "no snapshot read"); break; }
+                        if (!ver.wait_commit(e)) { strata::core::net_reply_err(nc, e); break; }
+                        pending.clear();
+                        const auto t0 = std::chrono::steady_clock::now();
+                        if (strata::core::conversation_snapshot_restore_streamed(*net_disk_img, ss, g, nullptr, e) !=
+                                strata::core::ConversationRestore::restored ||
+                            cudaDeviceSynchronize() != cudaSuccess) {
+                            net_disk_img.reset();
+                            net_checks.clear();
+                            std::fprintf(stderr, "strata serve: second PC: disk cache: restoring failed: %s\n", e.c_str());
+                            strata::core::net_reply_err(nc, "restoring its part failed: " + e);
+                            break;
+                        }
+                        net_checks.clear();   // the snapshot's checkpoints replace the ones of the session before
+                        for (ConvCheckpoint& c : net_disk_img->checkpoints) {
+                            const int64_t L = (int64_t) c.ids.size();
+                            net_checks[L] = std::move(c);
+                        }
+                        const int64_t L = (int64_t) net_disk_img->live.ids.size();
+                        net_disk_img.reset();
+                        strata::core::disk_touch_file(net_disk_path);
+                        std::fprintf(stderr, "strata serve: second PC: disk cache: restored %lld tokens (%zu checkpoints) in %.0f ms\n",
+                                     (long long) L, net_checks.size(),
+                                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                        strata::core::net_reply_ok(nc, nullptr, 0);
+                        break;
+                    }
+                    case strata::core::NetOp::DiskDiscard:
+                        // a read that did not go through; with a nonzero byte the first PC's K/V was written over too,
+                        // and this PC's (read from token 0 next) with it
+                        if (net_disk_img || (!msg.empty() && msg[0] != 0)) net_checks.clear();
+                        net_disk_img.reset();
+                        strata::core::net_reply_ok(nc, nullptr, 0);
+                        break;
+                    case strata::core::NetOp::DiskDrop: {
+                        int32_t nk = 0;
+                        if (msg.size() >= 4) std::memcpy(&nk, msg.data(), 4);
+                        if (nk < 0 || msg.size() != 4 + (size_t) nk * 16) { strata::core::net_reply_err(nc, "a malformed drop"); break; }
+                        if (!o.disk_cache.empty())
+                            for (int32_t i = 0; i < nk; ++i)
+                                strata::core::disk_drop_key(o.disk_cache, std::string((const char*) msg.data() + 4 + (size_t) i * 16, 16));
                         strata::core::net_reply_ok(nc, nullptr, 0);
                         break;
                     }
@@ -10961,6 +11524,7 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            int req_disk = 1;   // disk=0 (H-69): this request neither reads the disk cache nor writes to it
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -10985,6 +11549,7 @@ int main(int argc, char** argv) {
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "disk") req_disk = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -11191,6 +11756,23 @@ int main(int argc, char** argv) {
                                      "not kept after their reply); reading this prompt from token 0\n", n_checks,
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+            }
+            // H-69, the disk cache: what the RAM cache gives this prompt; a long conversation it does not continue is
+            // written before this request overwrites it (--disk-cache-switch), then a snapshot that gives more is read
+            if (dcache.on() && req_disk && o.prompt_cache > 0) {
+                int64_t dc_ram = 0;
+                bool dc_cont = false;
+                if (want_cvec == cvec_cached) {
+                    if (live_ok && starts_with(live, live_imgs)) { dc_ram = (int64_t) live.size(); dc_cont = true; }
+                    for (const ConvCheckpoint& c : checks)
+                        if ((int64_t) c.ids.size() > dc_ram && starts_with(c.ids, c.imgs)) dc_ram = (int64_t) c.ids.size();
+                }
+                if (o.disk_cache_switch && dc_live_disk && !dc_cont && live_ok && live_imgs.empty() &&
+                    (int64_t) live.size() >= o.disk_cache_min_tokens) {
+                    if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    dc_save(strata::core::kDiskSwitch, live, nullptr, dc_deepest(live));
+                }
+                if (req_imgs.empty() && dc_restore(ids, want_cvec, dc_ram) < 0) return 1;
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -13425,6 +14007,25 @@ int main(int argc, char** argv) {
                              (long long) (blobs - helper_blobs_before), (double) (bytes - helper_bytes_before) / 1048576.0);
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
+            }
+            // H-69: the answer is out (DONE above); what the disk cache keeps of this request.  A new system prompt's
+            // root, and a turn's end: a reply without a tool call (the agent's turn is over, the user writes next).
+            // A reply that calls a tool is mid-turn: the next request continues it from RAM, nothing is written.
+            dc_live_disk = req_disk != 0;
+            if (dcache.on() && req_disk && !cancelled && !nf_hit && req_imgs.empty()) {
+                if (root_at > 0)
+                    for (const ConvCheckpoint& c : checks)
+                        if ((int64_t) c.ids.size() == root_at) {
+                            dc_save(strata::core::kDiskRoot, c.ids, &c, nullptr);
+                            break;
+                        }
+                bool tool = false;
+                for (size_t i = (size_t) std::min<int64_t>(n, (int64_t) live.size()); i < live.size() && !tool; ++i)
+                    tool = live[i] == o.disk_cache_skip_token;
+                if (tool)
+                    std::fprintf(stderr, "strata serve: disk cache: the reply calls a tool (mid-turn): not written\n");
+                else if (live_ok && live_imgs.empty() && (int64_t) live.size() >= o.disk_cache_min_tokens)
+                    dc_save(strata::core::kDiskTurn, live, nullptr, dc_deepest(live));
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin

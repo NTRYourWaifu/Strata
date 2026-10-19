@@ -167,8 +167,9 @@ public:
     // a new file that did not exist (CREATE_NEW: never an existing file or link)
     bool create_new(const std::wstring& path) {
         h_ = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | (want_ ? FILE_FLAG_NO_BUFFERING : 0), nullptr);
         if (h_ == INVALID_HANDLE_VALUE) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
+        direct_ = want_;
         return true;
     }
     // a session to restore: the name itself is opened, never what a link or reparse point there points to; it must be
@@ -177,7 +178,8 @@ public:
         std::wstring w;
         if (!wide(path, w)) { refused_ = true; error_ = "the path is not valid UTF-8"; return false; }
         h_ = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN | (want_ ? FILE_FLAG_NO_BUFFERING : 0),
+                         nullptr);
         if (h_ == INVALID_HANDLE_VALUE) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
         BY_HANDLE_FILE_INFORMATION info{};
         if (!GetFileInformationByHandle(h_, &info)) { { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); } return false; }
@@ -189,6 +191,7 @@ public:
         }
         if (info.nNumberOfLinks != 1) { refused_ = true; error_ = "the file has more than one name (hard link)"; return false; }
         size = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        direct_ = want_;
         return true;
     }
     // a model input: links followed (model folders are often linked)
@@ -209,7 +212,11 @@ public:
         return true;
     }
     bool is_open() const { return h_ != INVALID_HANDLE_VALUE; }
-    bool direct() const { return false; }
+    // H-69: the next create_new / open_session bypasses the OS file cache (FILE_FLAG_NO_BUFFERING; the blocks are
+    // aligned and the last one padded, as for O_DIRECT).  A PC with little RAM free otherwise stalls in WriteFile
+    // while the cache makes room (10-19: one 16 MiB block, 120 s, 75 MiB free on the second PC)
+    void want_direct(bool on) { want_ = on; }
+    bool direct() const { return direct_; }
     bool write_all(const uint8_t* p, size_t n) {
         while (n) {
             DWORD w = 0;
@@ -240,9 +247,11 @@ public:
         return true;
     }
     bool truncate(uint64_t n) {
-        LARGE_INTEGER at{};
-        at.QuadPart = (LONGLONG) n;
-        if (SetFilePointerEx(h_, at, nullptr, FILE_BEGIN) && SetEndOfFile(h_)) return true;
+        // the end of file set by handle: SetEndOfFile refuses an end past the last sector on a FILE_FLAG_NO_BUFFERING
+        // handle (ERROR_INVALID_PARAMETER, 10-19); this call takes any length, buffered or not
+        FILE_END_OF_FILE_INFO eof{};
+        eof.EndOfFile.QuadPart = (LONGLONG) n;
+        if (SetFileInformationByHandle(h_, FileEndOfFileInfo, &eof, sizeof eof)) return true;
         { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
         return false;
     }
@@ -266,6 +275,7 @@ public:
 private:
     HANDLE h_ = INVALID_HANDLE_VALUE;
     SessionError kind_ = SessionError::io;
+    bool want_ = false, direct_ = false;
     bool refused_ = false;
     bool missing_ = false;
     std::string error_;
@@ -384,6 +394,7 @@ public:
         return true;
     }
     bool is_open() const { return fd_ >= 0; }
+    void want_direct(bool) {}   // O_DIRECT already, where the filesystem takes it
     bool direct() const { return direct_; }
     bool write_all(const uint8_t* p, size_t n) {
         while (n) {
@@ -602,6 +613,13 @@ public:
         }
         return true;
     }
+    // the next bytes in the read block without a copy: at most n, 0 at a read error or the end of the file
+    size_t peek(const uint8_t*& p, size_t n) {
+        if (at_ == have_ && !fill()) return 0;
+        p = buf_.get() + at_;
+        return std::min(n, have_ - at_);
+    }
+    void skip(size_t n) { at_ += n; }
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
@@ -749,6 +767,21 @@ struct In {
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
+    // n payload bytes handed to `put(p, c, at)` from the read block (hashed, never copied)
+    template<class Put> bool stream(size_t n, Put&& put) {
+        if (n > left) return fail("payload ends early");
+        for (size_t at = 0; at < n;) {
+            const uint8_t* p = nullptr;
+            const size_t c = f->peek(p, n - at);
+            if (!c) { kind = f->kind(); return fail("read error: " + f->error()); }
+            hash.update(p, c);
+            if (!put(p, c, at)) return false;
+            f->skip(c);
+            left -= c;
+            at += c;
+        }
+        return true;
+    }
 };
 
 bool get_checkpoint(In& in, ConversationCheckpoint& c) {
@@ -762,7 +795,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, const SessionKvSinks* sinks = nullptr, bool* touched = nullptr) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -781,6 +814,31 @@ bool get_payload(In& in, SavedConversation& s) {
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (sinks != nullptr) {   // H-69: each layer straight into its sink
+        std::vector<SessionKvSink> out;
+        std::string why;
+        if (!(*sinks)(s, out, why)) return in.fail(why);
+        if (n != out.size()) return in.fail("K/V layer count differs from this session's");
+        for (size_t i = 0; i < out.size(); ++i) {
+            const SessionKvSink& k = out[i];
+            in.kv_layer = i;
+            int64_t h[7];
+            for (int64_t& v : h) if (!in.i64(v)) return false;
+            if (h[0] != k.format || h[1] != k.cells || h[2] != k.heads || h[3] != k.head_dim || h[4] != k.page_size ||
+                h[5] != k.pooled_rows || h[6] != k.idx_dim) return in.fail("K/V geometry differs from this session's");
+            for (size_t part = 0; part < 5; ++part) {
+                uint64_t m = 0;
+                if (!in.count(m, 1)) return false;
+                if (m != k.sizes[part]) return in.fail("K/V part size differs from this session's");
+                if (!in.stream((size_t) m, [&](const uint8_t* p, size_t c, size_t at) {
+                        if (touched) *touched = true;
+                        if (k.write && k.write(part, at, p, c)) return true;
+                        return in.fail("K/V write: " + (k.error ? k.error() : std::string("failed")));
+                    })) return false;
+            }
+        }
+        return true;
+    }
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
         in.kv_layer = (size_t) (&k - s.kv.data());
@@ -1054,6 +1112,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     Publisher pub;
     if (!pub.open(path, error)) { st.error = pub.kind(); return false; }
     RawFile raw;
+    raw.want_direct(opt.unbuffered);
     if (!pub.create_temp(raw, error)) {
         st.error = raw.kind();
         error = "session file: cannot create a temporary file beside " + path + ": " + error;
@@ -1172,11 +1231,13 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 
 namespace {
 bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st,
+               const SessionKvSinks* sinks = nullptr, uint64_t streamed = 0, bool* touched = nullptr) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
     RawFile raw;
+    raw.want_direct(limits.unbuffered);
     uint64_t size = 0;
     if (!raw.open_session(path, size)) {
         st.error = raw.refused() ? SessionError::invalid : raw.kind();
@@ -1215,7 +1276,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_peak_bytes(size), why)) {
+        if (!limits.admit(session_read_peak_bytes(size - std::min(streamed, size)), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1223,7 +1284,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (!get_payload(in, parsed, sinks, touched)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
@@ -1244,6 +1305,24 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     bool ok = false;
     try {
         ok = read_impl(path, id, image, bytes, error, limits, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                                const SessionKvSinks& sinks, uint64_t streamed_bytes, size_t& bytes,
+                                std::string& error, bool& touched, const SessionReadLimits& limits,
+                                SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    touched = false;
+    try {
+        ok = read_impl(path, id, image, bytes, error, limits, st, &sinks, streamed_bytes, &touched);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
         st.error = SessionError::memory;

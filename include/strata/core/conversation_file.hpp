@@ -146,6 +146,7 @@ struct SessionWriteOptions {
     // write starts.  Not a reservation: other writers can take the space afterwards.
     uint64_t min_free_bytes = 0;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
+    bool unbuffered = false;        // H-69, Windows: past the OS file cache (FILE_FLAG_NO_BUFFERING; POSIX: O_DIRECT always)
     SessionProgress progress;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
@@ -222,6 +223,7 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    bool unbuffered = false;   // H-69, Windows: read past the OS file cache (FILE_FLAG_NO_BUFFERING)
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +236,28 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// H-69: the read's mirror of SessionKvSource - one K/V layer written from the file's read block straight to where it
+// lives (device or pinned host pool), so a read holds no host copy of the K/V.  `write(part, offset, src, n)`.
+struct SessionKvSink {
+    int format = 0;
+    int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+    std::array<size_t, 5> sizes{};
+    std::function<bool(size_t part, size_t offset, const void* src, size_t n)> write;
+    std::function<std::string()> error;
+};
+// Called once the file's running state and checkpoints are parsed (`meta`, its kv empty) and before any K/V byte is
+// read: the sinks, one per K/V layer of the file; false refuses the file (nothing written yet).
+using SessionKvSinks = std::function<bool(const SavedConversation& meta, std::vector<SessionKvSink>& sinks,
+                                          std::string& error)>;
+// session_file_read with the K/V streamed into the sinks.  The RAM preflight is asked for the file minus
+// `streamed_bytes` (the K/V the caller expects it to hold).  The sinks are written BEFORE the payload checksum is
+// checked: `touched` says one was, and then a failure leaves the targets partial (the caller must not run from them).
+// On success `image` holds everything but the K/V.
+bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                                const SessionKvSinks& sinks, uint64_t streamed_bytes, size_t& bytes,
+                                std::string& error, bool& touched, const SessionReadLimits& limits = {},
+                                SessionStatus* status = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
