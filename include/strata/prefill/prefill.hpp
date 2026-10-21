@@ -147,6 +147,9 @@ public:
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
+    /// S-6 (fork): after a `run` that `should_stop` ended, the position every stage's state is exactly at (the
+    /// chunks before it read whole, the later stages drained); -1 when the run did not stop cleanly.
+    int64_t cancelled_at() const { return cancelled_at_; }
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
@@ -217,6 +220,7 @@ private:
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
 
     std::string next_err_;
+    int64_t cancelled_at_ = -1;         ///< cancelled_at()
     std::future<bool> next_run_;
     int hand_buf_ = 0;
 

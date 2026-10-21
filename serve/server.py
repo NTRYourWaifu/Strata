@@ -984,6 +984,31 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def disk_save(self, timeout: float = 180.0) -> dict:
+        """S-6 (fork): `DISKSAVE` between requests (the caller holds the service's FIFO): the engine writes the live
+        conversation into its disk cache (--disk-cache, both PCs) before it is unloaded, so the same chat continues
+        from the SSD after the next load.  -> {"tokens": written (0: none), "ms": ..., "what": the engine's note};
+        raises ValueError when the engine does not know the command, EngineDied when it ended."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        self._send("DISKSAVE")
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the DISKSAVE command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the DISKSAVE command")
+            if line.startswith("DISKSAVED "):
+                f = line.split(maxsplit=3)
+                return {"tokens": int(f[1]), "ms": float(f[2]), "what": f[3] if len(f) > 3 else ""}
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the DISKSAVE command")
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -3188,6 +3213,34 @@ class Service:
                 ctl.release()
             self.fifo.release()
 
+    disk_save_wait_s = 60.0                              # S-6: how long POST /v1/disk-save waits for the stopped request
+
+    def disk_save(self, stop: bool = True) -> dict:
+        """S-6 (fork), POST /v1/disk-save: before the engine is unloaded (the launcher's stop), the live conversation
+        goes to the disk cache.  stop: a request still running is stopped first (it ends as a Stop, which keeps what
+        it read) instead of waited for.  -> {"status": "ok" | "not loaded", and the engine's figures}."""
+        if not hasattr(self.engine, "disk_save"):
+            raise ValueError("this engine has no disk cache")
+        if not self.loaded():
+            return {"status": "not loaded"}
+        with self.status_lock:
+            busy = bool(self.status.get("busy"))
+        if stop and busy:
+            try:
+                self.engine._send("STOP")                # the engine's reader takes it at once, mid-request
+            except EngineDied:
+                return {"status": "not loaded"}
+        if not self.fifo.acquire(timeout=self.disk_save_wait_s):
+            raise ModelBusy("a request is still running; try again when it has finished")
+        try:
+            if not self.loaded():
+                return {"status": "not loaded"}
+            out = self.engine.disk_save()
+            print(f"[strata] before unloading: {out['what']} ({out['tokens']} tokens, {out['ms']:.0f} ms)", flush=True)
+            return {"status": "ok", "stopped_a_request": stop and busy, **out}
+        finally:
+            self.fifo.release()
+
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
@@ -5219,6 +5272,14 @@ def make_handler(svc: Service):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
                     try:
                         self._json(200, svc.vram(r))
+                    except EngineDied as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                if path == "/v1/disk-save":                  # S-6 (fork): the live conversation to the SSD, before unloading
+                    if not self._own_page("the conversation can be written"):
+                        return
+                    try:
+                        self._json(200, svc.disk_save(req.get("stop", True) is not False))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

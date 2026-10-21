@@ -121,7 +121,8 @@ bool read_meta(const fs::path& p, DiskSnapshot& s) {
 }  // namespace
 
 const char* disk_kind_name(int32_t kind) {
-    return kind == kDiskRoot ? "system prompt root" : kind == kDiskSwitch ? "left for another conversation" : "turn end";
+    return kind == kDiskRoot ? "system prompt root" : kind == kDiskSwitch ? "left for another conversation"
+         : kind == kDiskStop ? "kept at a stop or before unloading" : "turn end";
 }
 
 std::string disk_snapshot_key(const std::vector<int32_t>& ids, bool cvec) {

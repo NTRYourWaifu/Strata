@@ -27,7 +27,8 @@ struct DiskSnapshot {
     int64_t used = 0;                ///< last written or read (ms since the epoch): the eviction order
 };
 
-enum DiskKind : int32_t { kDiskTurn = 0, kDiskRoot = 1, kDiskSwitch = 2 };
+// kDiskStop (S-6, fork): what a Stop left live, or the live conversation written before the engine is unloaded
+enum DiskKind : int32_t { kDiskTurn = 0, kDiskRoot = 1, kDiskSwitch = 2, kDiskStop = 3 };
 const char* disk_kind_name(int32_t kind);
 
 /// The snapshot's name: the token ids and the control vector's state, hashed.

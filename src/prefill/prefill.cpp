@@ -2138,7 +2138,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int ple_buf = 0;
 
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
-        if (should_stop && should_stop()) { err = "cancelled"; return false; }
+        if (should_stop && should_stop()) {
+            // S-6 (fork): every chunk before this one is done on this stage (its hand-off or on_chunk synchronized
+            // the stream), so the state is exactly at p0 once run() has drained the later stages: say so, with the
+            // PLE token window the end of the run would have left, so the caller can keep what was read
+            ss.ple_prev[0] = prev[0];
+            ss.ple_prev[1] = prev[1];
+            if (cudaStreamSynchronize(m.cs) == cudaSuccess && cudaStreamSynchronize(m.copy) == cudaSuccess)
+                cancelled_at_ = pos0 + c0;
+            err = "cancelled";
+            return false;
+        }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
@@ -4236,12 +4246,16 @@ bool Prefill::drain_pipeline(std::string& err) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    cancelled_at_ = -1;
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
 
-    if (!body_ok) return false;
+    if (!body_ok) {
+        if (!drain_ok) cancelled_at_ = -1;   // S-6: a later stage failed meanwhile: not a clean stop
+        return false;
+    }
     if (!drain_ok) {
         err = drain_err;
         return false;

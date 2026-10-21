@@ -9787,7 +9787,7 @@ int main(int argc, char** argv) {
             out = std::move(in_lines.front());
             in_lines.pop_front();
             lk.unlock();
-            if (src.idle_released() && out != "QUIT") idle_relock("a request");
+            if (src.idle_released() && out != "QUIT" && out != "DISKSAVE") idle_relock("a request");   // (S-6: the K/V only)
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
@@ -11268,6 +11268,36 @@ int main(int argc, char** argv) {
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            // S-6 (fork): DISKSAVE, between requests - the live conversation into the disk cache (--disk-cache), on
+            // both PCs, before the engine is unloaded: a turn the agent is still in (its last reply called a tool) is
+            // written only here.  Answers DISKSAVED <tokens written, 0: none> <ms> <what>.
+            if (line == "DISKSAVE") {
+                const auto t0 = Clock::now();
+                const char* what = nullptr;
+                if (!dcache.on()) what = "no disk cache";
+                else if (!dc_live_disk) what = "the last request asked for no disk (strata_disk false)";
+                else if (!live_ok || live.empty()) what = "nothing live";
+                else if (!live_imgs.empty()) what = "the conversation has pictures";
+                else if ((int64_t) live.size() < o.disk_cache_min_tokens) what = "shorter than --disk-cache-min-tokens";
+                else if (dcache.find(live, cvec_cached) >= 0) what = "already on the SSD";
+                int64_t wrote = 0;
+                if (what == nullptr) {
+                    if (!ver.wait_commit(err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    dc_save(strata::core::kDiskStop, live, nullptr, dc_deepest(live));
+                    const int f = dcache.on() ? dcache.find(live, cvec_cached) : -1;
+                    wrote = f >= 0 ? (int64_t) live.size() : 0;
+                    what = f >= 0 ? "written" : "writing failed (see the log)";
+                }
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                std::fprintf(stderr, "strata serve: disk cache: before unloading: %lld tokens live, %s\n",
+                             (long long) (live_ok ? live.size() : 0), what);
+                std::printf("DISKSAVED %lld %.0f %s\n", (long long) wrote, ms, what);
+                std::fflush(stdout);
+                continue;
+            }
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
             // RESTORED <tokens> <bytes> <ms>; SERR <invalid|storage|memory|io> <published 0|1> <reason> for a refusal
@@ -12625,6 +12655,10 @@ int main(int argc, char** argv) {
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 if (sp_ok) pp_exact = true;
+                // S-6 (fork): a Stop between two batched chunks leaves every stage (and the other PC) exactly at the
+                // last chunk the drafter took: what was read stays the live conversation, as between two windows
+                else if (!win && err == "cancelled" && sp.cancelled_at() > 0 && sp.cancelled_at() == pp_reached)
+                    pp_exact = true;
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -14012,8 +14046,11 @@ int main(int argc, char** argv) {
             // root, and a turn's end: a reply without a tool call (the agent's turn is over, the user writes next).
             // A reply that calls a tool is mid-turn: the next request continues it from RAM, nothing is written.
             dc_live_disk = req_disk != 0;
-            if (dcache.on() && req_disk && !cancelled && !nf_hit && req_imgs.empty()) {
-                if (root_at > 0)
+            // S-6 (fork): a Stop - while the prompt was read (`cancelled`, what was read kept live above) or while
+            // the reply was written - ends the turn here: the user may unload next, and what is only in RAM is gone
+            const bool stopped = cancelled || std::strcmp(finish, "cancel") == 0;
+            if (dcache.on() && req_disk && !nf_hit && req_imgs.empty()) {
+                if (root_at > 0)   // (a Stop past the root still read it whole)
                     for (const ConvCheckpoint& c : checks)
                         if ((int64_t) c.ids.size() == root_at) {
                             dc_save(strata::core::kDiskRoot, c.ids, &c, nullptr);
@@ -14022,10 +14059,26 @@ int main(int argc, char** argv) {
                 bool tool = false;
                 for (size_t i = (size_t) std::min<int64_t>(n, (int64_t) live.size()); i < live.size() && !tool; ++i)
                     tool = live[i] == o.disk_cache_skip_token;
-                if (tool)
+                const bool keep = live_ok && live_imgs.empty() && (int64_t) live.size() >= o.disk_cache_min_tokens;
+                if (!cancelled && !tool) {   // a turn's end (a Stop in a reply without a tool call too, as before)
+                    if (keep) dc_save(strata::core::kDiskTurn, live, nullptr, dc_deepest(live));
+                } else if (!stopped) {
                     std::fprintf(stderr, "strata serve: disk cache: the reply calls a tool (mid-turn): not written\n");
-                else if (live_ok && live_imgs.empty() && (int64_t) live.size() >= o.disk_cache_min_tokens)
-                    dc_save(strata::core::kDiskTurn, live, nullptr, dc_deepest(live));
+                } else if (keep) {
+                    // only when it gives a later prompt --disk-cache-min-gain more than the SSD has already
+                    std::vector<int64_t> l64(live.begin(), live.end());
+                    l64.push_back(-1);   // best() wants a prompt longer than the snapshot
+                    int64_t have = 0;
+                    dcache.best(l64, cvec_cached, dc_id.model, dc_id.config, dc_layout, have);
+                    if ((int64_t) live.size() >= have + o.disk_cache_min_gain)
+                        dc_save(strata::core::kDiskStop, live, nullptr, dc_deepest(live));
+                    else
+                        std::fprintf(stderr, "strata serve: disk cache: stopped at %lld tokens, the SSD already gives "
+                                             "%lld: not written\n", (long long) live.size(), (long long) have);
+                } else if (cancelled) {
+                    std::fprintf(stderr, "strata serve: disk cache: stopped while reading the prompt, nothing kept "
+                                         "live: not written\n");
+                }
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
