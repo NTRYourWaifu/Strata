@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,10 @@ public:
     /// shorter than it, else its deepest checkpoint that is.  Only snapshots of this identity, layout and control
     /// vector state count.  -1 when none; `resume` is the tokens it gives.  Ties: the smaller files.
     int best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model, uint64_t config, const std::string& layout,
+             int64_t& resume) const;
+    /// S-7 (fork): the same, with the config fingerprints `config_ok` accepts (given the snapshot's token count).
+    int best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model,
+             const std::function<bool(uint64_t config, size_t tokens)>& config_ok, const std::string& layout,
              int64_t& resume) const;
     /// The snapshot with exactly these ids and control vector state (any identity), or -1.
     int find(const std::vector<int32_t>& ids, bool cvec) const;

@@ -174,11 +174,17 @@ bool DiskCache::open(const std::string& dir, uint64_t cap_bytes, std::string& er
 
 int DiskCache::best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model, uint64_t config,
                     const std::string& layout, int64_t& resume) const {
+    return best(prompt, cvec, model, [config](uint64_t c, size_t) { return c == config; }, layout, resume);
+}
+
+int DiskCache::best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model,
+                    const std::function<bool(uint64_t config, size_t tokens)>& config_ok, const std::string& layout,
+                    int64_t& resume) const {
     int pick = -1;
     resume = 0;
     for (size_t i = 0; i < e_.size(); ++i) {
         const DiskSnapshot& s = e_[i];
-        if (s.cvec != cvec || s.model != model || s.config != config || s.layout != layout) continue;
+        if (s.cvec != cvec || s.model != model || s.layout != layout || !config_ok(s.config, s.ids.size())) continue;
         const size_t lim = std::min(s.ids.size(), prompt.size());
         size_t lcp = 0;
         while (lcp < lim && (int64_t) s.ids[lcp] == prompt[lcp]) ++lcp;

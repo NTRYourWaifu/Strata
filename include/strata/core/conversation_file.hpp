@@ -224,6 +224,9 @@ struct SessionReadLimits {
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
     bool unbuffered = false;   // H-69, Windows: read past the OS file cache (FILE_FLAG_NO_BUFFERING)
+    // S-7 (fork): a config fingerprint other than the identity's that the caller accepts too (the same settings at
+    // another --max-context: the saved bytes do not depend on it).  Unset: the identity's only.
+    std::function<bool(uint64_t config)> accept_config;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);

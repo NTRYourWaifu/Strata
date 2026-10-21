@@ -1268,7 +1268,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
-    if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
+    if (config != id.config && !(limits.accept_config && limits.accept_config(config))) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
         error = "session file: size " + std::to_string(size) + " does not match the header (" +
                 std::to_string(kHeader + payload + kTrailer) + ")";

@@ -8116,6 +8116,15 @@ int main(int argc, char** argv) {
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
         // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
         std::optional<uint64_t> model_fp, config_fp;
+        // S-7 (fork): the config fingerprint these settings would have at another --max-context (every multiple of
+        // 1024 up to 1M) -> that context.  The context is in the fingerprint, but a snapshot does not depend on it:
+        // the K/V is saved as the prefix of its cells (page by page, then the indexer's pooled rows), the running
+        // state has fixed sizes, and the rope is in the fingerprint on its own.  So a snapshot written at another
+        // context reads back as long as its tokens fit this one.  New files keep this context's fingerprint.
+        std::unordered_map<uint64_t, int64_t> ctx_twins;
+        auto config_ok = [&](uint64_t config, size_t tokens) {
+            return (config == *config_fp || ctx_twins.count(config) != 0) && tokens <= (size_t) o.max_context;
+        };
         auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
                                     const std::function<void()>& next_file) -> bool {
             if (!model_fp) {
@@ -8180,6 +8189,11 @@ int main(int argc, char** argv) {
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
                 config_fp = strata::core::session_config_fingerprint(c);
+                for (int64_t n = 1024; n <= (int64_t) 1 << 20; n += 1024) {
+                    if (n == o.max_context) continue;
+                    c.max_context = n;
+                    ctx_twins.emplace(strata::core::session_config_fingerprint(c), n);
+                }
             }
             id.model = *model_fp;
             id.config = *config_fp;
@@ -8513,11 +8527,15 @@ int main(int argc, char** argv) {
                 dc_layout = std::to_string(ss.layer_lo) + "-" + std::to_string(ss.layer_hi);
                 for (auto& st : stages) dc_layout += "," + std::to_string(st->ss.layer_lo) + "-" + std::to_string(st->ss.layer_hi);
                 if (net_first) dc_layout += ",net" + std::to_string(o.net_split);
-                size_t usable = 0;
+                size_t usable = 0, other_ctx = 0;
                 for (const auto& s : dcache.entries())
-                    usable += s.model == dc_id.model && s.config == dc_id.config && s.layout == dc_layout ? 1 : 0;
-                std::fprintf(stderr, "strata serve: disk cache: %s, %zu snapshots (%zu for this model and split), %.1f of "
-                                     "%.1f GiB%s\n", o.disk_cache.c_str(), dcache.entries().size(), usable,
+                    if (s.model == dc_id.model && s.layout == dc_layout && config_ok(s.config, s.ids.size())) {
+                        ++usable;
+                        other_ctx += s.config != dc_id.config ? 1 : 0;
+                    }
+                std::fprintf(stderr, "strata serve: disk cache: %s, %zu snapshots (%zu for this model and split%s), "
+                                     "%.1f of %.1f GiB%s\n", o.disk_cache.c_str(), dcache.entries().size(), usable,
+                             other_ctx ? (", " + std::to_string(other_ctx) + " of them written at another context").c_str() : "",
                              (double) dcache.dir_bytes() / 1073741824.0, o.disk_cache_gib,
                              net_first ? "; the other PC keeps its layers' part in its own folder" : "");
             }
@@ -8674,7 +8692,7 @@ int main(int argc, char** argv) {
         auto dc_restore = [&](const std::vector<int64_t>& rids, bool want_cv, int64_t ram_resume) -> int {
             if (!dcache.on()) return 0;
             int64_t cand = 0;
-            const int bi = dcache.best(rids, want_cv, dc_id.model, dc_id.config, dc_layout, cand);
+            const int bi = dcache.best(rids, want_cv, dc_id.model, config_ok, dc_layout, cand);
             if (bi < 0 || cand < ram_resume + o.disk_cache_min_gain) return 0;
             const strata::core::DiskSnapshot snap = dcache.at((size_t) bi);
             const auto t0 = Clock::now();
@@ -8721,6 +8739,7 @@ int main(int argc, char** argv) {
                 };
                 lim.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
                 lim.unbuffered = true;
+                lim.accept_config = [&](uint64_t c) { return c == snap.config && config_ok(c, snap.ids.size()); };
                 strata::core::SessionStatus st;
                 size_t b = 0;
                 uint64_t kvb = 0;
@@ -8814,10 +8833,13 @@ int main(int argc, char** argv) {
             cvec_cached = snap.cvec;
             live_ok = true;
             if (const int at = dcache.find(snap.ids, snap.cvec); at >= 0) dcache.touch((size_t) at);
+            const auto twin = ctx_twins.find(snap.config);
             std::fprintf(stderr, "strata serve: disk cache: read back %s (%s, %lld tokens, gives this prompt %lld; the RAM "
-                                 "cache had %lld) in %.0f ms (files %.0f ms, %.1f MB here)\n", snap.key.c_str(),
+                                 "cache had %lld%s) in %.0f ms (files %.0f ms, %.1f MB here)\n", snap.key.c_str(),
                          strata::core::disk_kind_name(snap.kind), (long long) snap.ids.size(), (long long) cand,
-                         (long long) ram_resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), read_ms,
+                         (long long) ram_resume,
+                         twin != ctx_twins.end() ? ("; written at --max-context " + std::to_string(twin->second)).c_str() : "",
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), read_ms,
                          (double) bytes / 1e6);
             return 1;
         };
@@ -10433,6 +10455,8 @@ int main(int argc, char** argv) {
                             };
                             lim.progress = [](uint64_t, uint64_t) { strata::core::progress_beat(); };
                             lim.unbuffered = true;
+                            // S-7: its part written at another --max-context reads back too (h.L fits this one)
+                            lim.accept_config = [&](uint64_t c) { return config_ok(c, (size_t) h.L); };
                             // the K/V straight into this GPU (no host copy); from its first byte the checkpoints here
                             // describe K/V that is gone
                             const strata::core::SessionKvSinks sinks = [&](const strata::core::SavedConversation& meta,
