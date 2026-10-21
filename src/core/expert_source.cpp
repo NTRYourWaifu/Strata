@@ -2819,6 +2819,32 @@ bool FileExpertSource::pin_cache_complement(
         }
     }
 
+    // H-81 (fork): STRATA_PARTIAL_PIN=1 in the whole resident mode too (upstream: only with a RAM budget).  The
+    // driver refuses one page-locked block this big on Windows (about half the RAM), so the copy is laid out in
+    // profile order, hottest first, and the largest prefix the driver takes is registered below: those experts are
+    // copied to the GPU by DMA (no CPU staging in the prompt path) and readable over PCIe (--pcie-frac).  The layout
+    // only changes where each blob sits in the arena, never what it holds.
+    static const bool whole_partial = [] {
+        const char* v = std::getenv("STRATA_PARTIAL_PIN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (pin && whole_partial && budget_bytes == 0 && bytes > 0 && rank != nullptr) {
+        std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
+        uint64_t at = 0;
+        auto place = [&](size_t i) {
+            if (offsets[i] == kNoComplement || ranked[i] != kNoComplement) return;
+            ranked[i] = at;
+            at += layer_blob_bytes_[i / (size_t) n_expert_];
+        };
+        for (const auto& pr : *rank)
+            if (pr.first >= 0 && pr.second >= 0 && pr.first < n_layers_ && pr.second < n_expert_)
+                place((size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second);
+        for (size_t i = 0; i < offsets.size(); ++i) place(i);   // the ones the profile does not rank, after
+        if (at == bytes) offsets.swap(ranked);
+        else std::fprintf(stderr, "FileExpertSource: H-81 hottest-first layout skipped (%.2f != %.2f GiB)\n",
+                          (double) at / 1073741824.0, (double) bytes / 1073741824.0);
+    }
+
     // A layer split: generate hands the copy every stage's lend region (`stage_lend_regions`, set before the
     // call).  The prompt path borrows the tail slots of EVERY part's cache, and with `additional_gpu_pairs`
     // non-empty the single lend region above is off - so without this the borrowed experts sat in neither
@@ -3044,7 +3070,7 @@ bool FileExpertSource::pin_cache_complement(
                                       (double) partial_pin / 1073741824.0);
                     note += std::string(note.empty() ? "" : "; ") + msg;
                     if (stop != nullptr) std::fprintf(stderr, "FileExpertSource: %s\n", msg);
-                } else if (budget_bytes > 0 && partial_on) {
+                } else if ((budget_bytes > 0 || whole_partial) && partial_on) {   // H-81: whole mode too
                     const uint64_t step = 2ull << 30;
                     for (uint64_t want = std::min(bytes, pin_cap); want >= step; want = want > step ? want - step : 0) {
                         // cut at an expert boundary: a blob that started inside the registered range and ran past it
