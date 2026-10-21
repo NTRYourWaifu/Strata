@@ -4234,6 +4234,14 @@ bool Prefill::drain_pipeline(std::string& err) {
         }
     }
 
+    if (remote_ && remote_drain) {   // S-9: the other PC's replies still owed (read even after an error: the link stays in step)
+        std::string remote_err;
+        if (!remote_drain(remote_err)) {
+            if (ok) err = remote_err;
+            ok = false;
+        }
+    }
+
     if (next_ != nullptr) {
         std::string tail_err;
         if (!next_->drain_pipeline(tail_err)) {

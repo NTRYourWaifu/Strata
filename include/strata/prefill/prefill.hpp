@@ -173,6 +173,10 @@ public:
     }
     std::function<bool(const float* rows, const int64_t* tokens, int64_t T, int64_t pos0, bool single_chunk,
                        std::string& err)> remote_next;
+    /// S-9 (fork): a `remote_next` that sends its chunk without waiting for the other PC's reply leaves replies owed;
+    /// this reads them all (in order) when the run ends, as drain_pipeline waits for a local next stage.  Null:
+    /// `remote_next` is send-and-wait.
+    std::function<bool(std::string& err)> remote_drain;
     /// TWO PCs (net): the next `run` reads the previous PC's rows (host, T x hc*n_embd, valid until it returns)
     /// instead of embedding the tokens.
     void set_hand_in(const float* rows, bool single_chunk) { hand_in_ = rows; single_chunk_ = single_chunk; }

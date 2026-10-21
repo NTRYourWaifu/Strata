@@ -328,8 +328,13 @@ bool NetLink::cvec(bool on, std::string& err) {
     return reply(err);
 }
 
-bool NetLink::prefill(const NetPrefillHead& h0, const int32_t* tokens, const float* rows, int64_t row_floats,
+bool NetLink::prefill(const NetPrefillHead& h, const int32_t* tokens, const float* rows, int64_t row_floats,
                       std::vector<float>* back, std::string& err) {
+    return prefill_send(h, tokens, rows, row_floats, err) && prefill_reply(h.T, row_floats, back != nullptr, back, err);
+}
+
+bool NetLink::prefill_send(const NetPrefillHead& h0, const int32_t* tokens, const float* rows, int64_t row_floats,
+                           std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
     NetPrefillHead h = h0;
     if (half) h.want_R |= NetRowsBf16;
@@ -346,16 +351,24 @@ bool NetLink::prefill(const NetPrefillHead& h0, const int32_t* tokens, const flo
         return false;
     }
     bytes_sent += sizeof h + (size_t) h.T * 4 + nr;
+    ms_prefill += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++prefill_chunks;
+    return true;
+}
+
+bool NetLink::prefill_reply(int32_t T, int64_t row_floats, bool want_back, std::vector<float>* back, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t nf = (size_t) T * (size_t) row_floats;
+    const size_t nr = nf * (half ? 2 : sizeof(float));
     std::vector<uint8_t> p;
-    if (!reply(err, back != nullptr ? &p : nullptr)) return false;
-    if (back != nullptr) {
+    if (!reply(err, want_back ? &p : nullptr)) return false;
+    if (want_back && back != nullptr) {
         if (p.size() < nr) { err = "net stage: a short prompt chunk reply"; return false; }
         back->resize(nf);
         if (half) net_from_bf16((const uint16_t*) p.data(), back->data(), nf);
         else std::memcpy(back->data(), p.data(), nr);
     }
     ms_prefill += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    ++prefill_chunks;
     return true;
 }
 

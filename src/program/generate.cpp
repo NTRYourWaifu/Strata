@@ -7866,8 +7866,50 @@ int main(int argc, char** argv) {
                     // a local split: the last local stage's prompt path hands its chunks over (and reports them: the
                     // drafter is on its device, on_chunk moves there below)
                     strata::prefill::Prefill& net_sp = multi_gpu ? stages.back()->sp : sp;
-                    net_sp.remote_next = [&net_sp, link, pf_R_d, D, net_dev](const float* rows, const int64_t* toks, int64_t T,
-                                                                             int64_t p0, bool single, std::string& e) -> bool {
+                    // S-9 (fork): up to STRATA_NET_PF_DEPTH chunks (default 2) are on the wire or on the other PC at once:
+                    // a chunk goes over as soon as this PC has read it, without waiting for the reply of the one before,
+                    // so the other PC finds it waiting when it ends that one instead of idling while ~10 MB of rows
+                    // cross the link both ways (10-21 log: each 512-token chunk took 1.2 s end to end, the other PC's
+                    // card 0.8 s of it).  The other PC reads its messages in order, so it needs nothing new; the replies
+                    // are read here in the order of the sends, the last ones when the run ends (remote_drain).  1: the
+                    // old send-and-wait.
+                    struct PfOwed {
+                        std::deque<std::pair<int64_t, int64_t>> sent;   // (pos0, T) of the chunks whose reply is unread
+                        std::vector<float> back;                          // the reply just read
+                        int64_t p0 = 0, T = 0;                            // ... and its chunk
+                    };
+                    const auto owed = std::make_shared<PfOwed>();
+                    const int pf_depth = [] {
+                        const char* v = std::getenv("STRATA_NET_PF_DEPTH");
+                        return v != nullptr ? std::max(1, std::min(8, std::atoi(v))) : 2;
+                    }();
+                    if (pf_depth != 1)
+                        std::fprintf(stderr, "strata serve: split across two PCs: up to %d prompt chunks in flight to the "
+                                             "other PC (STRATA_NET_PF_DEPTH=1: one at a time)\n", pf_depth);
+                    auto pf_recv = [link, pf_R_d, D, owed](std::string& e) -> bool {   // the oldest chunk's reply
+                        const auto [p0, T] = owed->sent.front();
+                        owed->sent.pop_front();
+                        owed->p0 = p0;
+                        owed->T = T;
+                        return link->prefill_reply((int32_t) T, D, pf_R_d != nullptr, &owed->back, e);
+                    };
+                    auto pf_report = [&net_sp, pf_R_d, D, owed](std::string& e) -> bool {   // ... handed to the draft layer
+                        if (!net_sp.on_chunk) return true;
+                        for (int64_t a = 0; a < owed->T; a += kPfRows) {
+                            const int64_t n = std::min(kPfRows, owed->T - a);
+                            if (pf_R_d != nullptr &&
+                                cudaMemcpy(pf_R_d, owed->back.data() + (size_t) a * (size_t) D,
+                                           (size_t) n * (size_t) D * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+                                e = "the prompt chunk's rows to the draft layer";
+                                return false;
+                            }
+                            if (!net_sp.on_chunk(pf_R_d, n, owed->p0 + a, e)) return false;
+                        }
+                        return true;
+                    };
+                    net_sp.remote_next = [link, pf_R_d, D, net_dev, owed, pf_depth, pf_recv, pf_report](
+                                             const float* rows, const int64_t* toks, int64_t T, int64_t p0, bool single,
+                                             std::string& e) -> bool {
                         const strata::core::OnDevice on_d(net_dev);   // called on a prompt-path thread
                         strata::core::NetPrefillHead h;
                         h.pos0 = p0;
@@ -7878,20 +7920,26 @@ int main(int argc, char** argv) {
                         h.want_R = pf_R_d != nullptr ? 1 : 0;
                         std::vector<int32_t> t32((size_t) T);
                         for (int64_t i = 0; i < T; ++i) t32[(size_t) i] = (int32_t) toks[i];
-                        std::vector<float> back;
-                        if (!link->prefill(h, t32.data(), rows, D, h.want_R ? &back : nullptr, e)) return false;
-                        if (!net_sp.on_chunk) return true;
-                        for (int64_t a = 0; a < T; a += kPfRows) {
-                            const int64_t n = std::min(kPfRows, T - a);
-                            if (pf_R_d != nullptr &&
-                                cudaMemcpy(pf_R_d, back.data() + (size_t) a * (size_t) D, (size_t) n * (size_t) D * sizeof(float),
-                                           cudaMemcpyHostToDevice) != cudaSuccess) {
-                                e = "the prompt chunk's rows to the draft layer";
-                                return false;
-                            }
-                            if (!net_sp.on_chunk(pf_R_d, n, p0 + a, e)) return false;
-                        }
+                        // the oldest reply first when the window is full; its rows reach the draft layer after this
+                        // chunk is on its way, so the other PC's next chunk is never held up by this PC's draft layer
+                        const bool landed = (int) owed->sent.size() >= pf_depth;
+                        if (landed && !pf_recv(e)) return false;
+                        if (!link->prefill_send(h, t32.data(), rows, D, e)) return false;
+                        owed->sent.emplace_back(p0, T);
+                        if (landed && !pf_report(e)) return false;
+                        if (pf_depth == 1) return pf_recv(e) && pf_report(e);   // send-and-wait
                         return true;
+                    };
+                    net_sp.remote_drain = [owed, pf_recv, pf_report](std::string& e) -> bool {
+                        bool ok = true;
+                        while (!owed->sent.empty()) {   // every reply is read, even after an error: the link stays in step
+                            std::string e2;
+                            if (!pf_recv(e2) || (ok && !pf_report(e2))) {
+                                if (ok) e = e2;
+                                ok = false;
+                            }
+                        }
+                        return ok;
                     };
                 }
                 std::fprintf(stderr, "strata serve: split across two PCs: layers 0-%lld here, %lld-%lld on %s (vocab %lld)\n",

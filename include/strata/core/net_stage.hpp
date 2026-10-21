@@ -140,7 +140,13 @@ public:
     /// layer's rows come back (T x row_floats).  Thread: one at a time, while nothing else uses the link.
     bool prefill(const NetPrefillHead& h, const int32_t* tokens, const float* rows, int64_t row_floats,
                  std::vector<float>* back, std::string& err);
-    double ms_prefill = 0;          ///< the prompt chunks' round trips, summed
+    /// S-9 (fork): `prefill` in two halves, so a chunk can go over before the reply of the one before is read (the
+    /// other PC reads its messages in order and finds the next chunk waiting when it ends one).  The replies are read
+    /// in the order of the sends; `T`, `want_back` as that chunk's send had them.
+    bool prefill_send(const NetPrefillHead& h, const int32_t* tokens, const float* rows, int64_t row_floats,
+                      std::string& err);
+    bool prefill_reply(int32_t T, int64_t row_floats, bool want_back, std::vector<float>* back, std::string& err);
+    double ms_prefill = 0;          ///< this PC's time blocked in the prompt chunks' sends and replies, summed
     int64_t prefill_chunks = 0;
     bool logits(int t, float* host, std::string& err);
     /// H-69: a disk cache message sent without waiting (the other PC reads or writes its part while this PC does its
