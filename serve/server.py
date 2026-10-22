@@ -191,6 +191,10 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
                         "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
                         "clarity in the final answer."}
+# S-11 (our fork, with "effort_position": "end"): the effort turns a conversation's earlier replies were written after,
+# by the sha1 of the prompt text in front of them; they stay in the next requests' prompts, so a reply written at a
+# non-base effort is reused like any other (newest kept, saved next to the run config across restarts)
+EFFORT_TURNS_MAX = 2048
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
@@ -3720,6 +3724,12 @@ class Service:
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
+        # S-11: the effort the prompt's start is rendered at ("effort_base", default the template's xhigh) and the
+        # effort turns kept for earlier replies (EFFORT_TURNS_MAX)
+        self.effort_base = "xhigh"
+        self.effort_turns = collections.OrderedDict()
+        self.effort_turns_path = None
+        self.effort_lock = threading.Lock()
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -4611,23 +4621,92 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def render_prompt(self, messages, tools, kwargs) -> str:
+    def effort_base_kwargs(self, kwargs) -> dict:
+        """S-11: the template arguments the prompt's start is rendered with under `effort_end`: the request's, at
+        `effort_base` (the template's own default when that is xhigh) and with thinking on."""
+        base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+        if self.effort_base != "xhigh":
+            base["reasoning_effort"] = self.effort_base
+        return base
+
+    def effort_history(self, messages, tools, base) -> tuple[str, bool]:
+        """S-11: the conversation rendered with `base` (no generation prompt), each earlier reply that was written
+        after an effort turn with that turn back in front of it - the prompt the engine read for it, so the reply it
+        holds is reused.  -> (text, whether one was put back).  Replies the template's text cannot be lined up with
+        (a count of assistant turns that differs, e.g. a template that merges them) get none."""
+        text = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
+        if not self.effort_turns:
+            return text, False
+        head = "<|im_start|>assistant\n"
+        spots, i = [], text.find(head)
+        while i >= 0:
+            spots.append(i)
+            i = text.find(head, i + 1)
+        if not spots or len(spots) != sum(1 for m in messages if m.get("role") == "assistant"):
+            return text, False
+        out, h, pos, put = [], hashlib.sha1(), 0, False
+        with self.effort_lock:
+            for s in spots:
+                piece = text[pos:s]
+                out.append(piece)
+                h.update(piece.encode("utf-8"))
+                level = self.effort_turns.get(h.hexdigest())
+                if level in EFFORT_TEXT:
+                    turn = EFFORT_TURN.format(EFFORT_TEXT[level])
+                    out.append(turn)
+                    h.update(turn.encode("utf-8"))
+                    put = True
+                pos = s
+        out.append(text[pos:])
+        return "".join(out), put
+
+    def record_effort(self, history: str, level: str) -> None:
+        """S-11: remember that the prompt `history` was answered after a `level` effort turn (newest kept)."""
+        key = hashlib.sha1(history.encode("utf-8")).hexdigest()
+        with self.effort_lock:
+            if self.effort_turns.get(key) == level:
+                self.effort_turns.move_to_end(key)
+                return
+            self.effort_turns[key] = level
+            self.effort_turns.move_to_end(key)
+            while len(self.effort_turns) > EFFORT_TURNS_MAX:
+                self.effort_turns.popitem(last=False)
+            path, data = self.effort_turns_path, list(self.effort_turns.items())
+        if path is not None:
+            try:
+                tmp = Path(str(path) + ".tmp")
+                tmp.write_text(json.dumps(data), encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as e:
+                print(f"[strata] effort turns not saved ({e}): kept in memory", flush=True)
+
+    def render_prompt(self, messages, tools, kwargs, record: bool = False) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
-        empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn.
+        S-11 (our fork): the default is `effort_base` (e.g. low: a client's everyday effort renders as it always did);
+        an earlier reply written after an effort turn keeps it in front (effort_history), and once a conversation has
+        one, every thinking turn gets its own, so the latest effort is the one nearest the answer.  `record` (a request
+        that will run, not a token count) remembers this request's turn for the next one."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        if not self.effort_end:
             return self.template.render(messages, tools=tools, **kwargs)
-        base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-        history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
-        full = self.template.render(messages, tools=tools, add_generation_prompt=True, **kwargs)
-        mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
+        level = None if off else ("xhigh" if effort in (None, "", "high") else effort)
+        if level not in (None, *EFFORT_TEXT):         # the template refuses it: as asked, for its own error
+            return self.template.render(messages, tools=tools, **kwargs)
+        history, put = self.effort_history(messages, tools, self.effort_base_kwargs(kwargs))
+        # the generation prompt alone (the template writes it from enable_thinking only)
+        one = [{"role": "user", "content": "x"}]
+        full = self.template.render(one, add_generation_prompt=True, **kwargs)
+        mine = self.template.render(one, add_generation_prompt=False, **kwargs)
         if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
-            return full
-        tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
-        return history + tail + full[len(mine):]
+            return self.template.render(messages, tools=tools, **kwargs)
+        turn = level is not None and (level != self.effort_base or put)
+        if turn and record:
+            self.record_effort(history, level)
+        return history + (EFFORT_TURN.format(EFFORT_TEXT[level]) if turn else "") + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
@@ -4636,7 +4715,7 @@ class Service:
         the control tokens the template writes are control tokens.  `store=False` (a token count) reuses the kept
         prompts without adding or replacing one."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
-        prompt = self.render_prompt(marked, marked_tools, kwargs)
+        prompt = self.render_prompt(marked, marked_tools, kwargs, record=store)
         plain = ()
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
@@ -4837,12 +4916,12 @@ class Service:
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
             marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
-            effort = kwargs.get("reasoning_effort")
-            off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
-            kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
-            kw["add_generation_prompt"] = False
-            text = self.template.render(marked, tools=marked_tools, **kw)
+            if self.effort_end:                                 # render_prompt's start (S-11: with the kept turns)
+                text, _ = self.effort_history(marked, marked_tools, self.effort_base_kwargs(kwargs))
+            else:
+                kw = dict(kwargs)
+                kw["add_generation_prompt"] = False
+                text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
@@ -8399,6 +8478,19 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    eb = cfg.get("effort_base", "xhigh")                # S-11: the effort the prompt's start is rendered at
+    if eb not in EFFORT_TEXT:
+        raise SystemExit(f'[strata] config "effort_base" must be one of {", ".join(EFFORT_TEXT)}, not {eb!r}')
+    svc.effort_base = eb
+    if svc.effort_end and a.config:                     # S-11: the kept effort turns, next to the run config
+        svc.effort_turns_path = Path(a.config).with_name("effort_turns.json")
+        try:
+            for k, v in json.loads(svc.effort_turns_path.read_text(encoding="utf-8"))[-EFFORT_TURNS_MAX:]:
+                if v in EFFORT_TEXT:
+                    svc.effort_turns[k] = v
+        except (OSError, ValueError, TypeError):
+            pass
+        print(f"[strata] effort turns: the start at {eb}, {len(svc.effort_turns)} earlier turn(s) kept", flush=True)
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
