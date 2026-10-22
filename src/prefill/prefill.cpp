@@ -874,6 +874,7 @@ struct Prefill::Impl {
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
+    const int32_t* host_res_all = nullptr;   // S-16: init's table; host_res is null on a foreign layer (set_foreign_below)
     int64_t T = 0, T_max = 0;
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
@@ -1368,7 +1369,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.T = chunk > 0 ? chunk : 1;
     return strata::metal_engine::window_ensure(g, ss, ss.qsa_states[ss.qsa_primary()].max_cells, err);
 #endif
-    m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
+    m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res; m.host_res_all = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
@@ -2934,6 +2935,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             double ps_acc = 0.0;
             for (int64_t l = LB; l < LE; ++l) {
+                m.host_res = l < res_lb_ ? nullptr : m.host_res_all;   // S-16: a foreign layer streams every expert
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
@@ -3082,6 +3084,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
         for (int64_t l = LB; l < LE; ++l) {
+            m.host_res = l < res_lb_ ? nullptr : m.host_res_all;   // S-16: a foreign layer's experts are all streamed
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
@@ -5090,6 +5093,49 @@ bool Prefill::drain_pipeline(std::string& err) {
     return ok;
 }
 
+// S-16 (fork): see set_offload.  The target reads [0, its end) as a first stage would (it embeds the tokens; the
+// residency table counts for its own layers only, set_foreign_below), with this stage's callbacks; this stage's
+// state goes over before and comes back after, so the decode that follows finds it where this stage would have left it.
+bool Prefill::run_offloaded(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    Prefill& t = *off_.target;
+    const auto t0 = Clock::now();
+    stopped_at_ = -1;
+    if (off_.before && !off_.before(pos0, err)) {
+        err = "prefill offload: " + err;
+        return false;
+    }
+    double sync_ms = ms_since(t0);
+    const int64_t own_lb = t.stage_lb_;
+    t.stage_lb_ = 0;
+    t.hand_in_ = nullptr;
+    t.hand_ev_ = nullptr;
+    t.hand_pieces_ = 0;
+    t.should_stop = should_stop;
+    t.stop_at_chunk = stop_at_chunk;
+    t.force_chunk_ = std::exchange(force_chunk_, 0);
+    t.force_single_ = force_single_;
+    t.force_planned_ = force_planned_;
+    const bool ok = t.run(tokens, n, pos0, err);
+    t.stage_lb_ = own_lb;
+    t.should_stop = nullptr;
+    t.stop_at_chunk = nullptr;
+    stopped_at_ = t.stopped_at_;
+    cancelled_at_ = t.cancelled_at_;
+    const int64_t reached = ok ? pos0 + (stopped_at_ >= 0 ? stopped_at_ : n) : cancelled_at_;
+    if (reached >= 0 && off_.after) {
+        const auto ts = Clock::now();
+        std::string e2;
+        if (!off_.after(reached, e2)) {
+            if (ok) err = "prefill offload: " + e2;
+            cancelled_at_ = -1;
+            return false;
+        }
+        sync_ms += ms_since(ts);
+    }
+    if (off_.report) off_.report(n, ms_since(t0), sync_ms);
+    return ok;
+}
+
 bool Prefill::reserve_uploads(int64_t T) {
     bool ok = true;
     if (impl_ != nullptr && T > 0) {
@@ -5118,6 +5164,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return ok;
     }
 #endif
+    if (off_.target != nullptr && n >= off_.min_tokens && hand_in_ == nullptr && embd_rows == nullptr)
+        return run_offloaded(tokens, n, pos0, err);
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;

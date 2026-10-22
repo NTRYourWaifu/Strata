@@ -30,6 +30,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/ssd_shadow_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -46,6 +47,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -3868,6 +3870,24 @@ int main(int argc, char** argv) {
     // only be trimmed once the split is known).  Every other run keeps the 0.1.39 order: weights first, then the
     // search - so without the trim nothing about a split moves.
     const bool late_weights = trim_asked && multi_gpu && split_auto;
+    // S-16 (fork): STRATA_S16_SHADOW=<s16_shadow.txt>.  A prompt of STRATA_S16_MIN tokens or more (default 1024) skips
+    // the first card: the second one reads it from layer 0, the first card's layers' experts streamed from SSD copies
+    // (SsdShadowSource, make_shadow.py), so a slow first card (a GTX 16: no tensor cores, a x1 link) no longer sets the
+    // prompt pace.  The second card then holds those layers' dense weights and state too (a few hundred MiB).  An
+    // explicit split whose first stage has only GDN layers (its state is a few MiB to hand over).
+    const std::string s16_manifest = [] { const char* v = std::getenv("STRATA_S16_SHADOW"); return std::string(v ? v : ""); }();
+    bool s16_on = false;
+    if (!s16_manifest.empty()) {
+        const char* why = !stage_trim ? "it needs an explicit --layer-split with STRATA_STAGE_TRIM=1"
+                        : split_at.empty() || split_devs.empty() ? "it needs a layer split across GPUs"
+                        : !o.serve ? "it needs --serve" : o.batch != 0 ? "not with --batch" : o.vision ? "not with --vision"
+                        : nullptr;
+        if (why == nullptr && strata::core::qsa_kv_resident() > 0)
+            for (int64_t l = 0; why == nullptr && !split_at.empty() && l < split_at[0]; ++l)
+                if (strata::core::is_qsa_layer(g, l)) why = "the first stage's attention layer streams its K/V (--kv-resident)";
+        if (why) std::fprintf(stderr, "strata generate: S-16 (STRATA_S16_SHADOW) is off: %s\n", why);
+        else s16_on = true;
+    }
     // keep_routers: CUDA0 with --mmap-experts keeps every layer's router (ffn_gate_inp, ~2.5 MiB a layer) - the file
     // tier's routing-aware prefetch (RouterLookahead, below) copies all of them from CUDA0's arena, and would
     // otherwise turn itself off
@@ -4088,6 +4108,7 @@ int main(int argc, char** argv) {
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
+    std::vector<float> s16_ple_emb_host((size_t) strata::kernels::NG_N_EMBD);   // S-16: the second card's PLE run
     if (!o.ple_gguf.empty()) {
         strata::kernels::PleIoOptions pio;
         pio.mode = o.ple_io == "mmap" || o.ple_io == "ram" ? strata::kernels::PleIo::Mmap : strata::kernels::PleIo::Direct;
@@ -4412,7 +4433,7 @@ int main(int argc, char** argv) {
         // Later stages' weights load here (0.1.39), except `--layer-split auto` with the trim asked: those load after
         // the split search (see late_weights), so `auto` can trim them too.
         if (!late_weights) {
-            const int64_t lb = stage_trim ? split_at[i] : 0;
+            const int64_t lb = stage_trim && !(s16_on && i == 0) ? split_at[i] : 0;   // S-16: the first stage's layers too
             const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : net_hi >= 0 ? net_hi : g.n_layers) : 0;
             if (!load_stage_weights(st, lb, le, stage_trim)) return 1;
         }
@@ -5340,10 +5361,60 @@ int main(int argc, char** argv) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
         void* sbuf_s = nullptr;
-        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
+        const int64_t ses_lo = s16_on && i == 0 ? 0 : st.lb;   // S-16: the first stage's GDN state too (handed over)
+        if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, ses_lo, st.le)) != cudaSuccess ||
+            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, ses_lo, st.le) == 0) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
             return 1;
+        }
+        if (s16_on && i == 0 && ss.ple.ready()) {
+            // S-16: this card reads layer 1's PLE for an offloaded prompt - the same wiring as CUDA0's (above), from its
+            // own copy of the weights; the table (host) is shared, only one prompt path reads at a time
+            strata::core::PleRun& pr = st.ss.ple;
+            const strata::core::WeightRef* wk = st.wt.find("blk.1.ple_key.weight");
+            const strata::core::WeightRef* wv = st.wt.find("blk.1.ple_value.weight");
+            const strata::core::WeightRef* wnk = st.wt.find("blk.1.ple_norm_key.weight");
+            const strata::core::WeightRef* wnq = st.wt.find("blk.1.ple_norm_query.weight");
+            const strata::core::WeightRef* wnc = st.wt.find("blk.1.ple_norm_conv.weight");
+            const strata::core::WeightRef* wc = st.wt.find("blk.1.ple_conv1d.weight");
+            if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
+                std::fprintf(stderr, "strata generate: S-16: CUDA%d has no blk.1.ple_* weights\n", st.dev);
+                return 1;
+            }
+            pr.w = strata::kernels::PleWeights{};
+            if (!wk->quantized()) pr.w.key_bf16 = (const uint16_t*) wk->data;
+            else if (wk->data != nullptr) {
+                pr.w.key_codes = (const uint8_t*) wk->data;
+                pr.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+            }
+            if (ss.ple.w.key_native_data != nullptr) {
+                pr.w.key_native_data = wk->native_data;
+                pr.w.key_native_type = wk->native_type;
+                pr.w.key_native_q8_1 = wk->native_q8_1;
+            }
+            pr.w.value_bf16 = (const uint16_t*) wv->data;
+            pr.w.norm_key = (const float*) wnk->data;
+            pr.w.norm_query = (const float*) wnq->data;
+            pr.w.norm_conv = (const float*) wnc->data;
+            pr.w.conv1d_f16 = (const uint16_t*) wc->data;
+            pr.consts = ss.ple.consts;
+            pr.table = ss.ple.table;
+            pr.token = &st.ss.ple_token;
+            pr.prev = st.ss.ple_prev;
+            pr.emb_host = s16_ple_emb_host.data();
+            float *ed = nullptr, *sc = nullptr;
+            if (cudaMalloc((void**) &ed, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+                cudaMalloc((void**) &sc, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: S-16: CUDA%d's PLE buffers failed\n", st.dev);
+                return 1;
+            }
+            pr.emb_dev = ed;
+            pr.scratch = sc;
+            pr.hist = st.ss.ple_hist;
+            if (!pr.ready()) {
+                std::fprintf(stderr, "strata generate: S-16: CUDA%d's PLE run is not ready\n", st.dev);
+                return 1;
+            }
         }
         const bool last = i + 1 == stages.size();
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
@@ -8799,6 +8870,18 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        // S-16 (fork): the second card's source for the first card's layers - SSD copies, read ahead (see s16_on)
+        std::unique_ptr<strata::core::SsdShadowSource> s16_src;
+        if (s16_on && srcp != nullptr && !stages.empty()) {
+            const char* wm = std::getenv("STRATA_S16_WINDOW_MIB");
+            const char* th = std::getenv("STRATA_S16_THREADS");
+            s16_src = strata::core::SsdShadowSource::open(srcp, s16_manifest, stages[0]->lb, wm ? std::atoll(wm) : 256,
+                                                          th ? std::atoi(th) : 0, err);
+            if (!s16_src) {
+                std::fprintf(stderr, "strata serve: S-16 is off: %s\n", err.c_str());
+                err.clear();
+            }
+        }
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -8815,8 +8898,10 @@ int main(int argc, char** argv) {
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
                 if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
-                if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
-                                err, sb, sbb)) {
+                const bool s16_here = s16_src && i == 0;
+                if (s16_here) st.sp.set_foreign_below(st.lb);   // S-16: layers [0, lb) are CUDA0's, streamed from SSD here
+                if (!st.sp.init(st.wt, g, st.ss, s16_here ? (strata::core::ExpertSource*) s16_src.get() : srcp, &st.cache,
+                                host_res.data(), o.prefill_chunk, (void*) st.stream, err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
@@ -8907,6 +8992,104 @@ int main(int argc, char** argv) {
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
+        }
+        if (s16_src) {
+            // S-16: the first card's state at a position goes to the second card before an offloaded prompt, and comes back
+            // after it: its GDN layers' recurrences and conv histories, the PLE history and token window (the split has no
+            // attention layer on the first card: checked at s16_on)
+            int s16_main_dev = 0;
+            cudaGetDevice(&s16_main_dev);
+            GpuStage& s16_st = *stages[0];
+            const uint64_t gdn_bytes = ((uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                        (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * 4;
+            const uint64_t hist_bytes = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4;
+            // `c0`..`c1`: the K/V cells of the first card's attention layers that go over (before: the conversation so far,
+            // [0, pos0); after: the cells the prompt wrote, [pos0, pos)) - whole pages, plus the indexer's state
+            auto s16_sync = [&, s16_main_dev, gdn_bytes, hist_bytes](bool to_second, int64_t c0, int64_t c1,
+                                                                     std::string& e) -> bool {
+                GpuStage& st = *stages[0];
+                auto settle = [&] {
+                    bool ok = true;
+                    { const strata::core::OnDevice a(s16_main_dev); ok = cudaDeviceSynchronize() == cudaSuccess && ok; }
+                    { const strata::core::OnDevice b(st.dev); ok = cudaDeviceSynchronize() == cudaSuccess && ok; }
+                    return ok;
+                };
+                if (!settle()) { e = std::string("the devices before the state copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+                auto copy = [&](void* first, void* second, uint64_t bytes) {
+                    return (to_second ? cudaMemcpyPeer(second, st.dev, first, s16_main_dev, bytes)
+                                      : cudaMemcpyPeer(first, s16_main_dev, second, st.dev, bytes)) == cudaSuccess;
+                };
+                int64_t gi = 0;
+                bool ok = true;
+                for (int64_t l = 0; ok && l < st.lb; ++l) {
+                    if (strata::core::is_qsa_layer(g, l)) continue;
+                    ok = copy((uint8_t*) ss.gdn_state + (uint64_t) (gi - ss.gdn_ord0) * gdn_bytes,
+                              (uint8_t*) st.ss.gdn_state + (uint64_t) (gi - st.ss.gdn_ord0) * gdn_bytes, gdn_bytes);
+                    ++gi;
+                }
+                if (ok && ss.ple_hist && st.ss.ple_hist) ok = copy(ss.ple_hist, st.ss.ple_hist, hist_bytes);
+                const strata::kernels::QsaShapes qs = strata::core::qsa_shapes(g);
+                int64_t qi = 0;
+                for (int64_t l = 0; ok && l < st.lb; ++l) {
+                    if (!strata::core::is_qsa_layer(g, l)) continue;
+                    strata::core::QsaState& a = ss.qsa_states[qi];
+                    strata::core::QsaState& b = st.ss.qsa_states[qi];
+                    ++qi;
+                    if (a.kv_mode != 0 || b.kv_mode != 0 || a.kv_elastic >= 0 || b.kv_elastic >= 0 || !a.kv_int8 || !b.kv_int8 ||
+                        a.kv_rot != b.kv_rot || a.n_pages != b.n_pages || a.idx_pooled_rows != b.idx_pooled_rows) {
+                        e = "layer " + std::to_string(l) + "'s K/V is not INT8 and whole in VRAM on both cards";
+                        return false;
+                    }
+                    const int64_t p0 = std::clamp<int64_t>(c0 / qs.page_size, 0, a.n_pages);
+                    const int64_t p1 = std::clamp<int64_t>((c1 + qs.page_size - 1) / qs.page_size, p0, a.n_pages);
+                    const uint64_t rows_pp = (uint64_t) qs.n_head_kv * qs.page_size;   // a page's rows, [page][head][cell]
+                    const uint64_t code = rows_pp * qs.head_dim, scale = rows_pp * (qs.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+                    if (p1 > p0) {
+                        ok = copy((uint8_t*) a.k_q + p0 * code, (uint8_t*) b.k_q + p0 * code, (p1 - p0) * code) &&
+                             copy((uint8_t*) a.v_q + p0 * code, (uint8_t*) b.v_q + p0 * code, (p1 - p0) * code) &&
+                             copy((uint8_t*) a.k_scale + p0 * scale, (uint8_t*) b.k_scale + p0 * scale, (p1 - p0) * scale) &&
+                             copy((uint8_t*) a.v_scale + p0 * scale, (uint8_t*) b.v_scale + p0 * scale, (p1 - p0) * scale);
+                    }
+                    ok = ok && copy(a.idx_tail, b.idx_tail, (uint64_t) (qs.idx_block - 1) * qs.idx_dim * 4) &&
+                         copy(a.idx_dead, b.idx_dead, (uint64_t) qs.idx_dim * 4) &&
+                         copy(a.idx_pooled, b.idx_pooled, (uint64_t) a.idx_pooled_rows * qs.idx_dim * 4) &&
+                         copy(a.idx_block_pos, b.idx_block_pos, 4);
+                }
+                if (!ok || !settle()) { e = std::string("the state copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+                if (to_second) {
+                    st.ss.ple_prev[0] = ss.ple_prev[0]; st.ss.ple_prev[1] = ss.ple_prev[1]; st.ss.ple_token = ss.ple_token;
+                } else {
+                    ss.ple_prev[0] = st.ss.ple_prev[0]; ss.ple_prev[1] = st.ss.ple_prev[1]; ss.ple_token = st.ss.ple_token;
+                }
+                return true;
+            };
+            strata::prefill::Prefill::Offload off;
+            off.target = &s16_st.sp;
+            const char* mv = std::getenv("STRATA_S16_MIN");
+            off.min_tokens = mv ? std::max<int64_t>(1, std::atoll(mv)) : 1024;
+            auto s16_pos0 = std::make_shared<int64_t>(0);
+            strata::core::SsdShadowSource* s16p = s16_src.get();
+            off.before = [s16_sync, s16_pos0, s16p](int64_t pos0, std::string& e) mutable {
+                *s16_pos0 = pos0;
+                s16p->begin_prompt();   // the window commits its RAM only for this prompt
+                const bool ok = s16_sync(true, 0, pos0, e);
+                if (!ok) s16p->end_prompt();
+                return ok;
+            };
+            off.after = [s16_sync, s16_pos0, s16p](int64_t pos, std::string& e) mutable {
+                s16p->end_prompt();
+                return s16_sync(false, *s16_pos0, pos, e);
+            };
+            const int s16_dev = s16_st.dev;
+            off.report = [s16p, s16_dev](int64_t n, double ms, double sync_ms) {
+                std::fprintf(stderr, "strata s16: %lld prompt tokens read on CUDA%d from layer 0 in %.0f ms (state hand-over "
+                                     "%.0f ms): %s\n", (long long) n, s16_dev, ms, sync_ms, s16p->take_stats().c_str());
+            };
+            sp.set_offload(std::move(off));
+            std::fprintf(stderr, "strata serve: S-16: prompts of %lld tokens or more skip CUDA0 - CUDA%d reads them from layer 0, "
+                                 "layers 0-%lld's experts from SSD copies (%s)\n",
+                         (long long) (mv ? std::max<int64_t>(1, std::atoll(mv)) : 1024), s16_dev,
+                         (long long) s16_st.lb - 1, s16_manifest.c_str());
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;

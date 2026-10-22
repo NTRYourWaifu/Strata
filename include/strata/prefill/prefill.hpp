@@ -241,6 +241,25 @@ public:
     /// instead of embedding the tokens.
     void set_hand_in(const float* rows, bool single_chunk) { hand_in_ = rows; single_chunk_ = single_chunk; }
 
+    /// S-16 (fork), on a layer split's FIRST stage: a prompt of at least `min_tokens` tokens skips this stage - the
+    /// next stage's path (`target`, another GPU) reads it from layer 0, with this stage's layers' experts streamed
+    /// from its source (an SsdShadowSource: SSD copies, no RAM).  `before(pos0)` gives the target this stage's state
+    /// (the GDN recurrences, the PLE history and token window) as it is at pos0; `after(pos)` takes it back once the
+    /// target has read up to pos (also after a clean stop).  A slow first card (no tensor cores, a x1 link) then holds
+    /// layers whose prompts it could not keep up with.  Everything else of `run` (the callbacks, stopped_at,
+    /// cancelled_at) is as if this stage had read the prompt.
+    struct Offload {
+        Prefill* target = nullptr;
+        int64_t min_tokens = 0;
+        std::function<bool(int64_t pos0, std::string& err)> before;
+        std::function<bool(int64_t pos, std::string& err)> after;
+        std::function<void(int64_t n, double ms, double sync_ms)> report;   // after each offloaded run
+    };
+    void set_offload(Offload o) { off_ = std::move(o); }
+    /// S-16 (fork), on the target: its cache and the residency table hold layers [own_lb, ...) only; a layer below
+    /// that (read for an offloading first stage) has every expert streamed from the source.
+    void set_foreign_below(int64_t own_lb) { res_lb_ = own_lb; }
+
     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's
     /// non-resident experts over its own PCIe link into its own (lent) prompt buffers, computes their rows, and sends
@@ -274,6 +293,9 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    bool run_offloaded(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);   // S-16
+    Offload off_;                       ///< S-16: set_offload
+    int64_t res_lb_ = 0;                ///< S-16: set_foreign_below
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
