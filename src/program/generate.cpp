@@ -8452,6 +8452,29 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: S-15 (STRATA_S15_SHADOW) is off: %s\n", serr.c_str());
             }
         }
+        // S-21 fork: STRATA_S21_SHADOW=<s21_shadow.txt> (a copy of every expert over several drives): with a RAM budget on
+        // one GPU the prompt path reads the file tier - the experts neither the GPU cache nor the RAM copy holds when a
+        // prompt starts, its lent slots' among them - from those copies, every drive at once; the decode keeps experts.bin
+        if (const char* sv = std::getenv("STRATA_S21_SHADOW"); sv != nullptr && sv[0] != '\0' && srcp == &src && !s15_src &&
+            prefill_helpers.empty() && stages.empty() && o.resident_budget > 0) {
+            const char* wm = std::getenv("STRATA_S21_WINDOW_MIB");
+            const char* th = std::getenv("STRATA_S21_THREADS");
+            const int64_t E = g.n_expert;
+            auto file_tier = [&host_res, &src, E](int64_t l, int64_t e) {
+                return host_res[(size_t) (l * E + e)] < 0 && !src.has_resident(l, e);
+            };
+            std::string serr;
+            s15_src = strata::core::PairShadowSource::open(srcp, sv, file_tier, wm ? std::atoll(wm) : 512,
+                                                           th ? std::atoi(th) : 0, serr);
+            if (s15_src) {
+                s15_src->set_refresh(file_tier);
+                prefill_src = s15_src.get();
+                std::fprintf(stderr, "strata serve: S-21: the prompt path reads the file tier (%lld experts now) from the SSD "
+                                     "copies in %s, the cycle chosen again at every prompt\n", (long long) s15_src->pairs(), sv);
+            } else {
+                std::fprintf(stderr, "strata serve: S-21 (STRATA_S21_SHADOW) is off: %s\n", serr.c_str());
+            }
+        }
         if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::atoi(hv) != 0 &&
             srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
             prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
@@ -10530,12 +10553,15 @@ int main(int argc, char** argv) {
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check;
+            // S-21 (fork) layer-major prefill: a sub-chunk before its super-chunk's end has the super-chunk's state - the
+            // checkpoint is taken at that end instead
+            const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check && !sp.layer_major_mid();
             // Keep the prefill's existing chunk geometry. One extra near-tail checkpoint
             // can serve a branch whose shared prefix ends before the final cached state.
             const bool tail_checkpoint = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
                 !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
-                pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
+                pp_total - done <= T &&   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
+                !sp.layer_major_mid();
             if ((periodic_checkpoint || tail_checkpoint) && !net_link) {
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk

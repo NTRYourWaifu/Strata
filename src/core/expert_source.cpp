@@ -1567,6 +1567,7 @@ bool FileExpertSource::idle_relock(std::string& note, const std::function<void(u
 }
 
 void FileExpertSource::close() {
+    dpf_stop();
     prefetch_end();
     ram_stop();
     io_stop();
@@ -3000,7 +3001,88 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
 #endif
 }
 
+void FileExpertSource::dpf_stop() {
+    {
+        std::lock_guard<std::mutex> lk(dpf_mu_);
+        dpf_quit_ = true;
+    }
+    dpf_cv_.notify_all();
+    for (std::thread& t : dpf_th_) t.join();   // a worker reads what is queued before it quits: those buffers are claimed
+    dpf_th_.clear();
+    dpf_quit_ = false;
+}
+
+void FileExpertSource::dpf_warm(int64_t layer, const int64_t* experts, int64_t n) {
+    static const size_t qmax = [] { const char* v = std::getenv("STRATA_S21_DPF_QUEUE"); return v ? (size_t) std::max(1, std::atoi(v)) : (size_t) 48; }();
+    std::vector<Fill> got;
+    {
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t e = experts[j];
+            if (e < 0 || e >= n_expert_) continue;
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+            if (complement_ready_ && resident_blob(index) != nullptr) continue;   // in the RAM copy
+            if (!override_.empty() && override_[index] != nullptr) continue;
+            if (stage_of_.find(layer * n_expert_ + e) != stage_of_.end()) continue;   // staged or being read already
+            {
+                std::lock_guard<std::mutex> qk(dpf_mu_);
+                if (dpf_q_.size() + got.size() >= qmax) { dpf_full_.fetch_add(1, std::memory_order_relaxed); continue; }
+            }
+            size_t v = 0;
+            bool fill = false;
+            if (!claim_stage(layer * n_expert_ + e, v, fill, true) && fill) {
+                stage_pf_[v] = 1;
+                got.push_back({v, layer, e, stage_buf_[v].get()});
+            }
+        }
+    }
+    if (got.empty()) return;
+    warm_count_.fetch_add(got.size(), std::memory_order_relaxed);
+    io_pf_bytes_.fetch_add(got.size() * layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+    const uint64_t before = dpf_n_.fetch_add(got.size(), std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(dpf_mu_);
+        for (const Fill& g : got) dpf_q_.push_back(g);
+        if (dpf_th_.empty()) {
+            static const int nt = [] { const char* v = std::getenv("STRATA_S21_DPF_THREADS"); return v ? std::max(1, std::atoi(v)) : 4; }();
+            for (int t = 0; t < nt; ++t)
+                dpf_th_.emplace_back([this] {
+                    std::vector<Fill> batch;
+                    for (;;) {
+                        batch.clear();
+                        {
+                            std::unique_lock<std::mutex> lk(dpf_mu_);
+                            dpf_cv_.wait(lk, [&] { return dpf_quit_ || !dpf_q_.empty(); });
+                            if (dpf_q_.empty()) return;
+                            while (!dpf_q_.empty() && batch.size() < 4) {
+                                batch.push_back(dpf_q_.front());
+                                dpf_q_.pop_front();
+                            }
+                        }
+                        const auto t0 = std::chrono::steady_clock::now();
+                        const bool ok = read_direct(batch.data(), batch.size());
+                        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                        for (const Fill& f : batch) {
+                            if (ok) publish_stage(f.v, f.layer, true, us / (double) batch.size());
+                            else (void) fill_stage(f.v, f.layer, f.e, f.dst);
+                        }
+                    }
+                });
+            std::fprintf(stderr, "strata s21: decode read-ahead on (%d threads, the look-ahead's predictions from the drive)\n", nt);
+        }
+    }
+    dpf_cv_.notify_all();
+    if ((before >> 13) != ((before + got.size()) >> 13))
+        std::fprintf(stderr, "strata s21 dpf: %llu read ahead, %llu used, %llu never used, %llu over the queue\n",
+                     (unsigned long long) (before + got.size()), (unsigned long long) io_pf_used_.load(),
+                     (unsigned long long) io_pf_unused_.load(), (unsigned long long) dpf_full_.load());
+}
+
 void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
+    if (dpf_env_ && !direct_.empty()) {
+        if (n > 0 && layer >= 0 && layer < n_layers_) dpf_warm(layer, experts, n);
+        return;
+    }
     if ((role_ptr_.empty() && !io_pf_) || n <= 0 || layer < 0 || layer >= n_layers_) return;
     uint32_t stamp;
     {
@@ -3559,7 +3641,9 @@ bool FileExpertSource::pin_cache_complement(
     // are pushed to the page file first (the copy, the headroom, and STRATA_SQUEEZE_EXTRA_GIB, default 3, for the
     // split stages' lend regions and the engine's later allocations).  Only for the first try (no budget): the soft
     // mode's second try (what fits) still follows when even that cannot make room.
-    if (budget_bytes == 0 && bytes > 0) {
+    // S-21 (fork): a RAM budget is squeezed for too (the budget, not the whole complement), else it is clamped to what the
+    // other programs left and the rest goes to the SSD
+    if (budget_bytes != kResidentWhatFits && bytes > 0) {
         static const bool squeeze = [] {
             const char* v = std::getenv("STRATA_RESIDENT_SQUEEZE");
             return v != nullptr && v[0] == '1';
@@ -3568,7 +3652,8 @@ bool FileExpertSource::pin_cache_complement(
             const char* v = std::getenv("STRATA_SQUEEZE_EXTRA_GIB");
             const double extra_gib = v != nullptr && std::atof(v) >= 0 ? std::atof(v) : 3.0;
             std::string note;
-            (void) strata::platform::make_room(bytes + headroom_bytes + (uint64_t) (extra_gib * 1073741824.0), note);
+            const uint64_t want = budget_bytes > 0 ? std::min(budget_bytes, bytes) : bytes;
+            (void) strata::platform::make_room(want + headroom_bytes + (uint64_t) (extra_gib * 1073741824.0), note);
             std::fprintf(stderr, "FileExpertSource: squeeze (H-49): %s\n", note.c_str());
             std::fflush(stderr);
         }

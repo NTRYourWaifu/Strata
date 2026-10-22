@@ -33,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <cstddef>
 #include <condition_variable>
@@ -948,7 +949,7 @@ public:
     bool io_sched() const { return io_sched_; }
     bool wants_scores() const override { return io_sched_ && io_pf_; }
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    bool warms() const override { return ((!role_ptr_.empty() || io_pf_) && direct_.empty()) || (dpf_env_ && !direct_.empty()); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
@@ -1186,6 +1187,18 @@ private:
     uint64_t io_budget_now() const;                    ///< (io_mu_ held) the per-window budget in bytes
     void io_window_tick();                             ///< begin_layer: a new decode window starts at layer 0
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
+    // S-21 (fork) STRATA_S21_DECODE_PF=1: the unbuffered reads take the look-ahead's predictions too - claimed as read-ahead
+    // stage buffers and read on their own threads, so a layer that asks for one finds it landed (or waits for it as for
+    // any fill another thread runs)
+    const bool dpf_env_ = [] { const char* v = std::getenv("STRATA_S21_DECODE_PF"); return v != nullptr && std::atoi(v) != 0; }();
+    std::mutex dpf_mu_;
+    std::condition_variable dpf_cv_;
+    std::deque<Fill> dpf_q_;
+    std::vector<std::thread> dpf_th_;
+    bool dpf_quit_ = false;
+    std::atomic<uint64_t> dpf_n_{0}, dpf_full_{0};
+    void dpf_warm(int64_t layer, const int64_t* experts, int64_t n);
+    void dpf_stop();
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},

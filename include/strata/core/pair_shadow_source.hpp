@@ -36,6 +36,10 @@ public:
                                                   int64_t window_mib, int threads, std::string& err);
     ~PairShadowSource() override;
 
+    /// S-21 (fork): the cycle is chosen again at every prompt_begin from every pair the manifest lists - the file tier
+    /// of a RAM budget moves with STRATA_RAM_ADAPT and the GPU cache's swaps, and the prompt path asks this source only
+    /// for the pairs neither holds then.  Unset (S-15): the cycle `open` chose stays.
+    void set_refresh(std::function<bool(int64_t, int64_t)> wanted) { refresh_ = std::move(wanted); }
     int64_t pairs() const { return P_; }
     int64_t listed_not_wanted() const { return skipped_; }
     /// The window holds RAM only while a prompt reads (Prefill::run): the decode then has the pages (the engine leaves
@@ -105,6 +109,10 @@ private:
     void advance_locked();                  // lo_ past the consumed / dropped entries
     void worker(int d);
 
+    void rebuild_locked();                  // S-21: the cycle from all_ and refresh_
+    struct Listed { int32_t l, e; uint8_t d; uint64_t off; };
+    std::vector<Listed> all_;               // every pair of the manifest, in (layer, expert) order
+    std::function<bool(int64_t, int64_t)> refresh_;
     ExpertSource* base_ = nullptr;
     int64_t L_ = 0, E_ = 0, P_ = 0;         // layers, experts per layer, pairs in the cycle
     int64_t skipped_ = 0;                   // listed in the manifest, not wanted (not the helper's in this run)

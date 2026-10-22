@@ -134,6 +134,8 @@ std::unique_ptr<PairShadowSource> PairShadowSource::open(ExpertSource* base, con
             err = manifest + ": expert " + std::to_string(x.l) + "." + std::to_string(x.e) + " has no aligned place";
             return nullptr;
         }
+        s->all_.push_back({(int32_t) x.l, (int32_t) x.e, (uint8_t) x.d, x.off});
+        s->max_stride_ = std::max(s->max_stride_, s->stride_[(size_t) x.l]);   // S-21: the window fits any cycle
         if (!wanted(x.l, x.e)) { ++s->skipped_; continue; }
         if (s->idx_of_[(size_t) (x.l * s->E_ + x.e)] >= 0) continue;
         s->idx_of_[(size_t) (x.l * s->E_ + x.e)] = (int32_t) s->layer_of_.size();
@@ -180,12 +182,33 @@ void PairShadowSource::prompt_begin() {
 #if defined(_WIN32)
     std::lock_guard<std::mutex> lk(mu_);
     if (active_) return;
+    if (refresh_) {
+        rebuild_locked();
+        if (P_ == 0) return;   // nothing on the file tier now: every ask is the base's
+    }
     if (!VirtualAlloc(arena_, (size_t) (W_ * (int64_t) max_stride_), MEM_COMMIT, PAGE_READWRITE)) return;   // asks read on the spot
     win_.assign((size_t) W_, Entry{});
     lo_ = next_ = 0;
     active_ = true;
     pump_locked();   // the first chunk's first layer
 #endif
+}
+
+void PairShadowSource::rebuild_locked() {
+    // between prompts: no read in flight (prompt_end waited for them), the workers idle on an empty queue
+    std::fill(idx_of_.begin(), idx_of_.end(), -1);
+    layer_of_.clear();
+    drive_of_.clear();
+    off_of_.clear();
+    skipped_ = 0;
+    for (const Listed& x : all_) {
+        if (!refresh_(x.l, x.e)) { ++skipped_; continue; }
+        idx_of_[(size_t) x.l * (size_t) E_ + (size_t) x.e] = (int32_t) layer_of_.size();
+        layer_of_.push_back(x.l);
+        drive_of_.push_back(x.d);
+        off_of_.push_back(x.off);
+    }
+    P_ = (int64_t) layer_of_.size();
 }
 
 void PairShadowSource::prompt_end() {
