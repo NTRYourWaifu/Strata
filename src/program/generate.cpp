@@ -30,6 +30,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/pair_shadow_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -4341,7 +4342,10 @@ int main(int argc, char** argv) {
                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
                         : o.batch != 0 ? "not with --batch slots"
                         : o.peer_device >= 1 ? "not with --peer-device"
-                        : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
+                        // S-15 fork: across two PCs this PC runs one stage, so its windows reach the CPU pool (and the
+                        // helpers in it) one after the other: the even and the odd verifier never serve a layer at once
+                        : helpers && !(net_first && split_devs.empty())
+                        ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
                         : nullptr;
         if (off != nullptr) {
             std::fprintf(stderr, "strata generate: --pipeline-windows %d is off: %s\n", o.pipeline_windows, off);
@@ -8253,7 +8257,15 @@ int main(int argc, char** argv) {
         }
         // the startup reads are done: the view of experts.bin back, the file tier as chosen above
         bool startup_kept = false;
-        if (src.startup_unbuffered()) {
+        // S-15 fork: with helper caches the file tier is every prompt chunk's source of their experts: keep it unbuffered
+        // (STRATA_HELPER_UNBUFFERED=0: mapped again, as upstream)
+        static const bool helper_ub = [] { const char* v = std::getenv("STRATA_HELPER_UNBUFFERED"); return !(v && v[0] == '0'); }();
+        if (src.startup_unbuffered() && remote_caches && helper_ub) {
+            src.keep_startup_unbuffered();
+            startup_kept = true;
+            std::fprintf(stderr, "strata generate: the startup reads are done: the file tier keeps reading unbuffered (the helper "
+                                 "caches' experts are read from it for every prompt chunk; STRATA_HELPER_UNBUFFERED=0: mapped again)\n");
+        } else if (src.startup_unbuffered()) {
             std::string why;
             const auto end_t0 = std::chrono::steady_clock::now();
             startup_kept = !src.end_startup_unbuffered(why);
@@ -8405,6 +8417,41 @@ int main(int argc, char** argv) {
         std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
+        // S-15 fork: STRATA_S15_HELPER_DUMP=<file>: the pairs the helpers hold, one "layer expert" a line (for make_shadow.py);
+        // STRATA_S15_SHADOW=<s15_shadow.txt>: the prompt path reads those pairs from the SSD copies it lists (PairShadowSource)
+        std::unique_ptr<strata::core::PairShadowSource> s15_src;
+        if (const char* dv = std::getenv("STRATA_S15_HELPER_DUMP"); dv != nullptr && dv[0] != '\0' && !prefill_helpers.empty()) {
+            if (std::FILE* df = std::fopen(dv, "w")) {
+                int64_t nd = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int32_t e = 0; e < (int32_t) g.n_expert; ++e)
+                        for (auto* h : prefill_helpers)
+                            if (h->holds(l, e)) { std::fprintf(df, "%lld %d\n", (long long) l, (int) e); ++nd; break; }
+                std::fclose(df);
+                std::fprintf(stderr, "strata serve: S-15: %lld helper pairs written to %s\n", (long long) nd, dv);
+            }
+        }
+        if (const char* sv = std::getenv("STRATA_S15_SHADOW"); sv != nullptr && sv[0] != '\0' && srcp != nullptr &&
+            !prefill_helpers.empty() && stages.empty()) {
+            const char* wm = std::getenv("STRATA_S15_WINDOW_MIB");
+            const char* th = std::getenv("STRATA_S15_THREADS");
+            std::string serr;
+            s15_src = strata::core::PairShadowSource::open(
+                srcp, sv, [&](int64_t l, int64_t e) {
+                    for (auto* h : prefill_helpers) if (h->holds(l, (int32_t) e)) return true;
+                    return false;
+                }, wm ? std::atoll(wm) : 256, th ? std::atoi(th) : 0, serr);
+            if (s15_src) {
+                prefill_src = s15_src.get();
+                int64_t held = 0;
+                for (auto* h : prefill_helpers) held += h->resident();
+                std::fprintf(stderr, "strata serve: S-15: the prompt path reads %lld of the helpers' %lld experts from the SSD "
+                                     "copies in %s (%lld listed pairs are not the helpers' in this run)\n",
+                             (long long) s15_src->pairs(), (long long) held, sv, (long long) s15_src->listed_not_wanted());
+            } else {
+                std::fprintf(stderr, "strata serve: S-15 (STRATA_S15_SHADOW) is off: %s\n", serr.c_str());
+            }
+        }
         if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::atoi(hv) != 0 &&
             srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
             prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
@@ -9225,6 +9272,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            ver_b.set_remote_expert_opt(remote_opt.get());   // S-15 fork: the odd windows reduce the helper's rows too
             if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
@@ -10879,7 +10927,10 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
-            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
+            // S-15 fork: with --pipeline-windows 2 the helper's cache stays as filled (its swaps copy into slots a window
+            // in flight may read)
+            if (remote_opt && o.pipeline_windows < 2 &&
+                !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
             std::vector<std::pair<float, int32_t>> cand, vict;

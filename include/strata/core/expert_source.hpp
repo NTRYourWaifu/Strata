@@ -268,6 +268,10 @@ public:
         return got;
     }
     virtual void prefetch_end() {}
+    /// S-15 fork: a prompt read begins / ended (Prefill::run): a source that reads ahead for prompts holds its buffers only
+    /// in between.  Default: nothing.
+    virtual void prompt_begin() {}
+    virtual void prompt_end() {}
     /// 149 STRATA_IO_PF_GATE: whether the decode's read-ahead runs now (the look-ahead then predicts one layer, not two)
     virtual bool read_ahead_open() const { return true; }
     /// 0.2.0: the source the Linux file-tier defaults apply to (the GGUF read in place); STRATA_COLD_OVERLAP's default
@@ -894,6 +898,11 @@ public:
     bool begin_startup_unbuffered(std::string& why);
     /// False when the view could not be mapped again: then the file tier stays unbuffered, `why` says so.
     bool end_startup_unbuffered(std::string& why);
+    /// S-15 fork: end the startup without mapping the view again - the file tier keeps reading unbuffered, as when
+    /// end_startup_unbuffered cannot map it.  For the helper caches: their experts are left out of the RAM copy, so
+    /// every prompt chunk reads them from the drive, and through the file cache of a PC short of RAM that fell to
+    /// 0.6 GB/s (a 20K-token prompt 45 -> 327 s).
+    void keep_startup_unbuffered() { startup_ub_ = false; }
     bool startup_unbuffered() const { return startup_ub_; }
     /// Every expert's bytes (n_layers x n_expert blobs).
     uint64_t expert_bytes() const;

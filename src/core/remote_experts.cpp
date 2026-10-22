@@ -1,5 +1,6 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+#include "strata/core/keep_warm.hpp"   // S-15 fork: a GTX 16xx helper idles to P3 like a short stage
 #include "strata/core/remote_expert_opt.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -276,6 +277,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     std::fill(owned_.begin(), owned_.begin() + n, 0);
     group_id_.clear(); ptr_.clear(); start_.clear(); dst_.clear(); tok_.clear(); original_row_.clear();
     if (!layers_present_[(size_t) layer]) return true;
+    keep_warm_poke(device_);   // S-15 fork: see keep_warm.hpp
     std::fill(group_of_.begin(), group_of_.begin() + n, -1);
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = ids[i];

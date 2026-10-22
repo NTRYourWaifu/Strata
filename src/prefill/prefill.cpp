@@ -5118,10 +5118,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return ok;
     }
 #endif
+    if (impl_ && impl_->src) impl_->src->prompt_begin();   // S-15 fork (PairShadowSource)
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+    if (impl_ && impl_->src) impl_->src->prompt_end();
 
     if (!body_ok) {
         if (!drain_ok) cancelled_at_ = -1;   // S-6: a later stage failed meanwhile: not a clean stop
