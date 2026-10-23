@@ -3720,7 +3720,9 @@ bool FileExpertSource::pin_cache_complement(
         // GiB) from the GGUF (a fresh 17K-token prompt 24 GB).  As the unbudgeted path does, take the lend region's
         // experts from the last slot down (the order the borrowing takes them) while they fit in what the budget has
         // left; the ones past it keep the file fallback, and `rank` keeps its precedence (the hottest experts first).
-        if (lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty()) {
+        // S-25 (STRATA_S25_HELPER): a helper GPU's pairs only (no split stage lends) leave the primary's lend region as it is
+        if (lend_from_slot >= 0 && lend_from_slot < n_slots &&
+            (additional_gpu_pairs.empty() || (s25_helper() && stage_lend_regions_.empty()))) {
             budget_lendable = n_slots - lend_from_slot;
             std::vector<size_t> order;   // the pairs in the lend region, highest slot first
             for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
@@ -4925,6 +4927,10 @@ int tail_skip_rank() {
     return r;
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
+bool s25_helper() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_S25_HELPER"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
@@ -5007,7 +5013,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int tail_rank = tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+        if (tail_rank > 0 && d.peer == nullptr && (d.remote_count == 0 || s25_helper())) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -5019,6 +5025,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[distinct[q]];
                 if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                if (d.remote_count > 0 && helper_holds(e)) continue;   // S-25: the helper computes it - no miss
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;

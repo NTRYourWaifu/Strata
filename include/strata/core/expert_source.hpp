@@ -675,6 +675,10 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
+/// S-25 (fork): STRATA_S25_HELPER=1 - a helper GPU (--expert-cache-device1) keeps what the single-GPU RAM budget mode has:
+/// the route tail skip (for the experts neither card holds), STRATA_RAM_ADAPT (never promoting a helper's expert into RAM),
+/// the budget's lend region in RAM and the S-21 SSD copies on the prompt path.  Unset: unchanged.
+bool s25_helper();
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);

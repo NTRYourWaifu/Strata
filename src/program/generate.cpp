@@ -8456,7 +8456,7 @@ int main(int argc, char** argv) {
         // one GPU the prompt path reads the file tier - the experts neither the GPU cache nor the RAM copy holds when a
         // prompt starts, its lent slots' among them - from those copies, every drive at once; the decode keeps experts.bin
         if (const char* sv = std::getenv("STRATA_S21_SHADOW"); sv != nullptr && sv[0] != '\0' && srcp == &src && !s15_src &&
-            prefill_helpers.empty() && stages.empty() && o.resident_budget > 0) {
+            (prefill_helpers.empty() || strata::core::s25_helper()) && stages.empty() && o.resident_budget > 0) {
             const char* wm = std::getenv("STRATA_S21_WINDOW_MIB");
             const char* th = std::getenv("STRATA_S21_THREADS");
             const int64_t E = g.n_expert;
@@ -16434,6 +16434,13 @@ int main(int argc, char** argv) {
                     const char* e = std::getenv("STRATA_RAM_ADAPT");
                     return e != nullptr ? std::max(0, std::atoi(e)) : 0;
                 }();
+                // S-25 (STRATA_S25_HELPER): with a helper GPU the RAM copy still follows the conversation, its experts left out
+                const bool s25_on = drive.d.remote_count > 0 && strata::core::s25_helper();
+                auto s25_holds = [&](int64_t l, int32_t e) {
+                    for (int r = 0; r < drive.d.remote_count; ++r)
+                        if (drive.d.remote[r]->holds(l, e)) return true;
+                    return false;
+                };
                 if (ram_adapt_n > 0 && ram_adapt2.on && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
                     !remote_opt && o.batch == 0) {
@@ -16457,6 +16464,7 @@ int main(int argc, char** argv) {
                         outs.clear();
                         for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                             if (r[e] >= 0) continue;   // in VRAM
+                            if (s25_on && s25_holds(l, e)) continue;   // S-25: on the helper GPU, not in the RAM copy
                             const float ue = u[e] + (sd != nullptr ? sd[e] : 0.0f);
                             if (src.has_resident(l, e)) outs.push_back({ue, e});
                             else if (ue >= 2.0f) ins.push_back({ue, e});
@@ -16519,6 +16527,7 @@ int main(int argc, char** argv) {
                         int32_t in = -1, out = -1;
                         for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                             if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
+                            if (s25_on && s25_holds(l, e)) continue;   // S-25: on the helper GPU, not in the RAM copy
                             if (src.has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
                             else if (u[e] >= kRamAdaptRouted && (in < 0 || u[e] > u[in])) in = e;
                         }
