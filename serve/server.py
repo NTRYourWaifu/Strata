@@ -3730,6 +3730,7 @@ class Service:
         self.effort_turns = collections.OrderedDict()
         self.effort_turns_path = None
         self.effort_lock = threading.Lock()
+        self.effort_texts = dict(EFFORT_TEXT)          # S-11: the trailing turns' sentences (the config's "effort_texts")
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -4632,8 +4633,8 @@ class Service:
     def effort_history(self, messages, tools, base) -> tuple[str, bool]:
         """S-11: the conversation rendered with `base` (no generation prompt), each earlier reply that was written
         after an effort turn with that turn back in front of it - the prompt the engine read for it, so the reply it
-        holds is reused.  -> (text, whether one was put back).  Replies the template's text cannot be lined up with
-        (a count of assistant turns that differs, e.g. a template that merges them) get none."""
+        holds is reused.  -> (text, whether one was put back).  Each assistant turn the text has is looked up by the
+        whole text in front of it, so one the template leaves out (an empty reply) or merges only goes without."""
         text = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
         if not self.effort_turns:
             return text, False
@@ -4642,7 +4643,7 @@ class Service:
         while i >= 0:
             spots.append(i)
             i = text.find(head, i + 1)
-        if not spots or len(spots) != sum(1 for m in messages if m.get("role") == "assistant"):
+        if not spots:
             return text, False
         out, h, pos, put = [], hashlib.sha1(), 0, False
         with self.effort_lock:
@@ -4652,7 +4653,7 @@ class Service:
                 h.update(piece.encode("utf-8"))
                 level = self.effort_turns.get(h.hexdigest())
                 if level in EFFORT_TEXT:
-                    turn = EFFORT_TURN.format(EFFORT_TEXT[level])
+                    turn = EFFORT_TURN.format(self.effort_texts[level])
                     out.append(turn)
                     h.update(turn.encode("utf-8"))
                     put = True
@@ -4706,7 +4707,7 @@ class Service:
         turn = level is not None and (level != self.effort_base or put)
         if turn and record:
             self.record_effort(history, level)
-        return history + (EFFORT_TURN.format(EFFORT_TEXT[level]) if turn else "") + full[len(mine):]
+        return history + (EFFORT_TURN.format(self.effort_texts[level]) if turn else "") + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
@@ -8482,6 +8483,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if eb not in EFFORT_TEXT:
         raise SystemExit(f'[strata] config "effort_base" must be one of {", ".join(EFFORT_TEXT)}, not {eb!r}')
     svc.effort_base = eb
+    et = cfg.get("effort_texts") or {}                  # S-11: other sentences for the trailing turns, by level
+    if not isinstance(et, dict) or any(k not in EFFORT_TEXT or not isinstance(v, str) or not v.strip()
+                                       for k, v in et.items()):
+        raise SystemExit(f'[strata] config "effort_texts" must map {", ".join(EFFORT_TEXT)} to sentences, not {et!r}')
+    svc.effort_texts.update(et)
     if svc.effort_end and a.config:                     # S-11: the kept effort turns, next to the run config
         svc.effort_turns_path = Path(a.config).with_name("effort_turns.json")
         try:

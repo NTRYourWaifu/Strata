@@ -895,8 +895,24 @@ class EffortAtTheEnd(unittest.TestCase):
         first = len(self.checkpoint(self.ids(turn1, True, **low), True))
         # the engine's rule: the next turn (the same effort) reuses the first turn's whole conversation
         self.assertEqual(self.session([(turn1, low), (turn2, low)], True, True), [first])
-        # without it the checkpoint held the effort turn and the next turn reused nothing (what #458 measured)
-        self.assertEqual(self.session([(turn1, low), (turn2, low)], True, False), [0])
+        # without it the checkpoint holds the effort turn: #458 measured that the next turn reused nothing; S-11 (our
+        # fork) puts that turn back in front of the reply it was answered with, so the next turn reuses it all
+        whole = len(self.checkpoint(self.ids(turn1, True, **low), False))
+        self.assertEqual(self.session([(turn1, low), (turn2, low)], True, False), [whole])
+
+    def test_an_empty_reply_keeps_the_earlier_effort_turns(self):
+        """S-11: a reply the template leaves out (no text: the answer was all thinking) still lets the effort turns of
+        the replies before it be put back - the next prompt starts with the conversation up to that reply's turn."""
+        low, med = {"reasoning_effort": "low"}, {"reasoning_effort": "medium"}
+        empty = {"role": "assistant", "content": "", "reasoning_content": "all of it"}
+        turn2 = self.CHAT + [self.REPLY, self.NEXT]
+        turn3 = turn2 + [empty, {"role": "user", "content": "Again?"}]
+        self.ids(self.CHAT, True, **med)                 # recorded: REPLY was answered after a medium turn
+        before = self.tok.decode(self.ids(turn2, True, **low))
+        before = before[:before.rindex("<|im_start|>system\n")]   # turn2's own effort turn: the engine's checkpoint
+        after = self.tok.decode(self.ids(turn3, True, **low))
+        self.assertTrue(after.startswith(before))
+        self.assertIn("Reasoning effort is set to medium", after)
 
     def test_the_config(self):
         from serve.server import effort_end_args
