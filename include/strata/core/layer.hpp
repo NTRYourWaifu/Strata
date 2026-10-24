@@ -239,6 +239,10 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    /// S-31 (kv_remote.hpp, STRATA_S31_KV_DEV): the pools above are on this other CUDA device (-1: on the session's
+    /// own), which runs the layer's decode append and attention; `rtable` is the identity page table there.  Mode 0.
+    int kv_dev = -1;
+    int32_t* rtable = nullptr;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)

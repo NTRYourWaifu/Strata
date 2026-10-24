@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/core/kv_remote.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/warm_policy.hpp"
 #include <atomic>
@@ -1065,7 +1066,7 @@ bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != n
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
-    if (q0.kv_mode != 1) return;
+    if (q0.kv_mode != 1 && q0.kv_dev < 0) return;   // streamed, or S-31's K/V on the second card
     if (stage_own() && o_borrowed.count_only) return;
     Alloc own;
     own.owned = o_borrowed.owned;
@@ -1560,7 +1561,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
-    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1 ||   // KV streaming (or S-31): the staging pool's identity page table
+        ss.qsa_states[ss.qsa_primary()].kv_dev >= 0) {
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
@@ -2644,7 +2646,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const char* e = std::getenv("STRATA_KV_PREFETCH");
         return e ? std::atoi(e) != 0 : false;
     }();
-    const bool kv_prefetch = kv_prefetch_on;
+    const bool kv_prefetch = kv_prefetch_on || ss.qsa_states[ss.qsa_primary()].kv_dev >= 0;
     if (kv_prefetch) {
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
@@ -2911,7 +2913,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
                 const core::QsaState& state = ss.qsa_states[ordinal];
-                if (state.kv_mode != 1) { ++ordinal; continue; }
+                if (state.kv_mode != 1 && state.kv_dev < 0) { ++ordinal; continue; }
                 // Reuse one KV pool only after its last attention reader completes. The next layer's
                 // [0, p0) host prefix is immutable throughout this chunk; its new rows are appended later.
                 if (cudaEventRecord(m.kv_released, cs) != cudaSuccess ||
@@ -2919,6 +2921,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = "prefill: releasing KV staging pool";
                     return false;
                 }
+                if (state.kv_dev >= 0)   // S-31: from the second card
+                    core::kv_remote_stage_in(state, m.stage, (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
+                else
                 strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
                     core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
                 if (cudaPeekAtLastError() != cudaSuccess ||
@@ -3309,7 +3314,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
-                    const core::QsaState& st = ss.qsa_states[qsa_index];
+                    // S-31: a K/V on the second card - this layer's cells [0, p0) come over into the staging pool, the chunk is
+                    // appended and attended there (the view below: the staging pool as a resident state's pools), its pages go back
+                    const core::QsaState& st_own = ss.qsa_states[qsa_index];
+                    const bool rkv = st_own.kv_dev >= 0;
+                    core::QsaState st_view;
+                    if (rkv) {
+                        st_view = st_own;
+                        st_view.k_pool = m.stage.k_pool; st_view.v_pool = m.stage.v_pool;
+                        st_view.k_q = m.stage.k_q; st_view.v_q = m.stage.v_q;
+                        st_view.k_scale = m.stage.k_scale; st_view.v_scale = m.stage.v_scale;
+                        st_view.k_q4 = m.stage.k_q4; st_view.v_q4 = m.stage.v_q4;
+                        st_view.page_table = m.ident_table;
+                        st_view.kv_dev = -1;
+                        pt.mark(kPfKvStage, cs);
+                        if (kv_pending == qsa_index) {   // prefetched on m.kv_copy while the layers before ran
+                            if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
+                                err = "prefill: waiting for KV prefetch";
+                                return false;
+                            }
+                            kv_pending = -1;
+                        } else core::kv_remote_stage_in(st_own, m.stage, (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                        pt.mark(kPfQsa, cs);
+                    }
+                    const core::QsaState& st = rkv ? st_view : st_own;
                     const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                           *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
                                           *wik = need(v, "indexer.k_proj.weight", err),
@@ -3386,6 +3414,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
+                    if (rkv) core::kv_remote_stage_out(st_own, m.stage, p0 / s.page_size,
+                                                       (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
@@ -5645,6 +5675,20 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         return true;
     };
 
+    // S-31: a K/V on the second card comes into the staging pool once per (layer, super-chunk) - its later sub-chunks
+    // find their predecessors' cells there - and the next QSA layer's while the layers between run (m.kv_copy)
+    const bool lm_rkv = ss.qsa_states[ss.qsa_primary()].kv_dev >= 0;
+    int64_t lm_kv_pending = -1;
+    if (lm_rkv && ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
+                   (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
+                   (!m.kv_ready && cudaEventCreateWithFlags(&m.kv_ready, cudaEventDisableTiming) != cudaSuccess))) {
+        err = "prefill (layer-major): KV prefetch stream/events";
+        return false;
+    }
+    struct LmKvDrain {
+        cudaStream_t stream;
+        ~LmKvDrain() { if (stream) cudaStreamSynchronize(stream); }
+    } lm_kv_drain{lm_rkv ? m.kv_copy : nullptr};
     for (int64_t sc0 = 0; sc0 < n; sc0 += S) {
         const int64_t Sn = std::min(S, n - sc0);
         const int64_t nc = (Sn + m.T - 1) / m.T;
@@ -5872,7 +5916,32 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         ++gdn_index;
                     } else if (half == 0) {
                         // ======================= QSA (run_impl's, without its debug dumps) =======================
-                        const core::QsaState& st = ss.qsa_states[qsa_index];
+                        // S-31: a K/V on the second card - this layer's cells [0, p0) come over into the staging pool, the chunk is
+                        // appended and attended there (the view below: the staging pool as a resident state's pools), its pages go back
+                        const core::QsaState& st_own = ss.qsa_states[qsa_index];
+                        const bool rkv = st_own.kv_dev >= 0;
+                        core::QsaState st_view;
+                        if (rkv) {
+                            st_view = st_own;
+                            st_view.k_pool = m.stage.k_pool; st_view.v_pool = m.stage.v_pool;
+                            st_view.k_q = m.stage.k_q; st_view.v_q = m.stage.v_q;
+                            st_view.k_scale = m.stage.k_scale; st_view.v_scale = m.stage.v_scale;
+                            st_view.k_q4 = m.stage.k_q4; st_view.v_q4 = m.stage.v_q4;
+                            st_view.page_table = m.ident_table;
+                            st_view.kv_dev = -1;
+                            pt.mark(kPfKvStage, cs);
+                            if (c == 0 && lm_kv_pending == qsa_index) {   // prefetched while the layers before ran
+                                if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
+                                    err = "prefill (layer-major): waiting for KV prefetch";
+                                    return false;
+                                }
+                                lm_kv_pending = -1;
+                            } else if (c == 0) {
+                                core::kv_remote_stage_in(st_own, m.stage, (p0 + s.page_size - 1) / s.page_size, s, cs);
+                            }
+                            pt.mark(kPfQsa, cs);
+                        }
+                        const core::QsaState& st = rkv ? st_view : st_own;
                         const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                               *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
                                               *wik = need(v, "indexer.k_proj.weight", err),
@@ -5934,6 +6003,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                                     core::qsa_kv_format(st), p0 / s.page_size,
                                                                     (p0 + T + s.page_size - 1) / s.page_size, s, cs);
                         }
+                        if (rkv) core::kv_remote_stage_out(st_own, m.stage, p0 / s.page_size,
+                                                           (p0 + T + s.page_size - 1) / s.page_size, s, cs);
                         split_q(m.Qf, m.q, T, cs);
                         rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, cs);
                         rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), cs);
@@ -5987,6 +6058,22 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         pt.mark(kPfQsa, cs);
                         gate_attn(m.attn, m.Qf, m.attn_h, T, cs);
                         if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                        // S-31: the super-chunk's last sub-chunk of this layer, its attention queued: the next QSA layer's
+                        // cells [0, pos0 + sc0) into the staging pool on m.kv_copy while the layers between run
+                        if (rkv && c + 1 == nc && qsa_index + 1 < g.n_qsa_layers() && pos0 + sc0 > 0) {
+                            const core::QsaState& nx = ss.qsa_states[qsa_index + 1];
+                            if (cudaEventRecord(m.kv_released, cs) != cudaSuccess ||
+                                cudaStreamWaitEvent(m.kv_copy, m.kv_released, 0) != cudaSuccess) {
+                                err = "prefill (layer-major): releasing KV staging pool";
+                                return false;
+                            }
+                            core::kv_remote_stage_in(nx, m.stage, (pos0 + sc0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
+                            if (cudaEventRecord(m.kv_ready, m.kv_copy) != cudaSuccess) {
+                                err = "prefill (layer-major): enqueueing KV prefetch";
+                                return false;
+                            }
+                            lm_kv_pending = qsa_index + 1;
+                        }
                         ++qsa_index;
                     } else {
                         // ======================= the FFN half: router + shared expert now, the experts later =========

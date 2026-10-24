@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/kv_remote.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -3265,6 +3266,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    if (strata::core::kv_remote_device() >= 0) {   // S-31 (kv_remote.hpp): the main layers' whole K/V on a second card
+        if (o.kv_resident > 0 || o.batch > 0) {
+            std::fprintf(stderr, "strata generate: STRATA_S31_KV_DEV takes the whole K/V of one sequence: not with "
+                                 "--kv-resident or --batch\n");
+            return 2;
+        }
+    }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.

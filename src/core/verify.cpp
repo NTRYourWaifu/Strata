@@ -514,6 +514,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
     for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
+    kvr_.release();   // S-31: both cards' waits on the K/V exchange
     std::atomic_thread_fence(std::memory_order_seq_cst);
     _mm_sfence();
     const OnDevice on_device(device_);
@@ -1020,6 +1021,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                              cudaMemcpyHostToDevice) == cudaSuccess;
         }
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
+    }
+    // S-31: the main layers' K/V on a second card - their decode attention crosses to it (kv_remote.hpp)
+    if (!kvr_.on() && ss.qsa_states[ss.qsa_primary()].kv_dev >= 0) {
+        if (lb_ != 0 || le_ != g.n_layers) { err = "verify: S-31 (STRATA_S31_KV_DEV) does not take a layer split"; return false; }
+        std::string kerr;
+        if (!kvr_.init((int) g.n_qsa_layers(), max_t, cap_, attn_scratch_floats_, s, kerr)) { err = "verify: " + kerr; return false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -1680,7 +1687,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sidem) idx_snap(cs);
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
+                // S-31: a K/V on the second card is appended there, from the rows the exchange below carries
+                const bool rkv = st.kv_dev >= 0;
+                if (rkv && (batch_rec_ || G != 1)) { err = "verify: S-31 (STRATA_S31_KV_DEV) takes one sequence, no window split"; return false; }
+                if (rkv) {
+                } else if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                     const int32_t* step_b = step_ + tb * kStepCount;
                     const float* kc_b = kcur_ + tb * NKV * HD;
                     const float* vc_b = vcur_ + tb * NKV * HD;
@@ -1823,6 +1834,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
                 stamp(l, 11, grp);
+                if (rkv) {   // S-31: queries, the window's K/V rows, selections and steps out; the attention back
+                    stamp(l, 12, grp);
+                    if (qbr) join(0);
+                    kvr_.publish((int) qi, qcur_ + tb * NH * HD, kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD,
+                                 sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cs);
+                    kvr_.collect((int) qi, attn_ + tb * NH * HD, n, cs);
+                } else {
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
@@ -1836,6 +1854,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                           (uint64_t) n * (uint64_t) attn_scratch_floats_, attn_ + tb * NH * HD, n, cs)))
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                }
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
@@ -2440,6 +2459,16 @@ bool Verifier::capture(int T, std::string& err) {
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
+    if (kvr_.on() && !kvr_.captured(T)) {   // S-31: the K/V card's half of the window, in the order this one publishes
+        std::vector<std::pair<int, const QsaState*>> layers;
+        for (int64_t l = 0, qi = 0; l < le_; ++l)
+            if (is_qsa_layer(*g_, l)) {
+                if (l >= lb_) layers.push_back({(int) qi, &ss_->qsa_states[qi]});
+                ++qi;
+            }
+        std::string kerr;
+        if (!kvr_.capture(T, layers, kerr)) { err = "verify: " + kerr; return false; }
+    }
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
@@ -2704,6 +2733,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+    if (kvr_.on() && !kvr_.launch(T, err)) return false;   // S-31: the K/V card's half first: it waits for this one
     const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
@@ -2790,6 +2820,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
             return value != nullptr && value[0] == '1';
         }();
+        if (kvr_.on() && !kvr_.launch(T, err)) return false;   // S-31: the K/V card's half first: it waits for this one
         launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
@@ -4143,6 +4174,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
+    if (kvr_.on() && !kvr_.launch(T, err)) return false;   // S-31: the K/V card's half first: it waits for this one
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }

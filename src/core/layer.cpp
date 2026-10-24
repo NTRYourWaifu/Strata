@@ -1,6 +1,8 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/kv_remote.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -754,6 +756,10 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     }
     return p;
 }
+/// S-31: a main layer's whole K/V goes to the second card (kv_remote.hpp)
+bool kv_remote_main(const KvPlan& p, int64_t ring_cells) {
+    return kv_remote_device() >= 0 && ring_cells == 0 && p.mode == 0;
+}
 uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
@@ -775,7 +781,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+    if (!(g_kv_elastic && p.mode == 0) && !kv_remote_main(p, ring_cells))   // elastic: own VMM range; S-31: the other card
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
@@ -811,7 +817,19 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    // S-31: the pools on the second card, carved from one allocation there (with its identity page table)
+    st.kv_dev = -1;
+    st.rtable = nullptr;
+    Cursor rc{nullptr};
+    const bool remote = kv_remote_main(p, ring_cells);
+    if (remote) {
+        const uint64_t pb = kv_pool_bytes(s, p.slots, st.kv_hybrid, st.kv_int8 || st.kv_hybrid) + 4 * 16;
+        rc.p = (uint8_t*) kv_remote_alloc(pb + (uint64_t) pages * 4 + 64);
+        if (rc.p == nullptr) return 0;
+        st.kv_dev = kv_remote_device();
+    }
+    Cursor& pc = remote ? rc : c;   // where the pools are carved
+    if (g_kv_elastic && p.mode == 0 && !remote) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -847,20 +865,27 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_elastic = (int32_t) g_pools.size();
         g_pools.push_back(std::move(pool));
     } else if (st.kv_hybrid) {
-        st.k_q = c.take<int8_t>(rows * s.head_dim);
-        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-        st.v_q4 = c.take<uint8_t>(rows * q4_row);
+        st.k_q = pc.take<int8_t>(rows * s.head_dim);
+        st.k_scale = pc.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        st.v_q4 = pc.take<uint8_t>(rows * q4_row);
     } else if (st.kv_q4) {
-        st.k_q4 = c.take<uint8_t>(rows * q4_row);
-        st.v_q4 = c.take<uint8_t>(rows * q4_row);
+        st.k_q4 = pc.take<uint8_t>(rows * q4_row);
+        st.v_q4 = pc.take<uint8_t>(rows * q4_row);
     } else if (st.kv_int8) {   // st, not the global: the drafter's ring is INT8 under --kv k8v4 too
-        st.k_q = c.take<int8_t>(rows * s.head_dim);
-        st.v_q = c.take<int8_t>(rows * s.head_dim);
-        st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-        st.v_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        st.k_q = pc.take<int8_t>(rows * s.head_dim);
+        st.v_q = pc.take<int8_t>(rows * s.head_dim);
+        st.k_scale = pc.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        st.v_scale = pc.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
     } else {
-        st.k_pool = c.take<uint16_t>(rows * s.head_dim);
-        st.v_pool = c.take<uint16_t>(rows * s.head_dim);
+        st.k_pool = pc.take<uint16_t>(rows * s.head_dim);
+        st.v_pool = pc.take<uint16_t>(rows * s.head_dim);
+    }
+    if (remote) {
+        st.rtable = rc.take<int32_t>((uint64_t) pages);
+        std::vector<int32_t> tab((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
+        const OnDevice on(st.kv_dev);
+        if (cudaMemcpy(st.rtable, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) return 0;
     }
     st.page_table = c.take<int32_t>((uint64_t) pages);
     st.n_pages = pages;
@@ -970,7 +995,10 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
     const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
-    if (st.kv_hybrid) {
+    // S-31: the pools on the other card are not cleared either (no reader names a cell this sequence has not written,
+    // like a streamed state's host copy below) - and this stream's card could not clear them
+    if (st.kv_dev >= 0) {
+    } else if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
