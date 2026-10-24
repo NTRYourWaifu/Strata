@@ -1631,6 +1631,11 @@ void FileExpertSource::close() {
     direct_.clear();
     for (void* h : pdirect_) close_direct(h);
     pdirect_.clear();
+#if defined(_WIN32)
+    for (void* h : dshadow_h_) CloseHandle((HANDLE) h);
+#endif
+    dshadow_h_.clear();
+    dshadow_at_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
@@ -2386,7 +2391,9 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
         // #286: overlapped batches - every role window of 16 blobs in flight at once; a big batch (the profile
         // fill) on up to 4 threads, a decode layer's few misses on this one
         std::atomic<size_t> next{0};
+        const bool dec = tl_decode;   // S-37: the decode's reads stay the decode's on the extra threads
         auto work = [&] {
+            tl_decode = dec;
             for (size_t at; (at = next.fetch_add(16)) < todo.size();) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
                 const auto t0 = std::chrono::steady_clock::now();
@@ -2495,6 +2502,93 @@ bool FileExpertSource::open_direct(std::string& why) {
     (void) why;
     return false;
 #endif
+}
+
+bool FileExpertSource::open_decode_shadow(const std::string& manifest, std::string& why) {
+#if defined(_WIN32)
+    if (direct_.empty() || !role_ptr_.empty()) { why = "the decode does not read experts.bin unbuffered"; return false; }
+    std::ifstream f(manifest);
+    if (!f) { why = "cannot read " + manifest; return false; }
+    std::vector<int64_t> at((size_t) (n_layers_ * n_expert_), -1);
+    std::vector<std::string> paths;
+    std::vector<uint64_t> stride((size_t) n_layers_, 0);
+    std::string line;
+    int64_t listed = 0;
+    while (std::getline(f, line)) {
+        std::istringstream is(line);
+        std::string k;
+        is >> k;
+        if (k == "drive") {
+            int i = 0;
+            double wt = 0;
+            is >> i >> wt;
+            std::string p;
+            std::getline(is, p);
+            p.erase(0, p.find_first_not_of(' '));
+            if (i != (int) paths.size()) { why = "drive lines out of order in " + manifest; return false; }
+            paths.push_back(p);
+        } else if (k == "layer") {
+            int64_t l = 0, bb = 0, st = 0;
+            uint64_t off = 0;
+            is >> l >> bb >> st >> off;
+            if (l < 0 || l >= n_layers_) continue;
+            if ((uint64_t) bb != layer_blob_bytes_[(size_t) l] || off != layer_offsets_[(size_t) l] || st < bb || st % 4096 != 0) {
+                why = manifest + ": layer " + std::to_string(l) + " is not this pack's";
+                return false;
+            }
+            stride[(size_t) l] = (uint64_t) st;
+        } else if (k == "x") {
+            int64_t l = -1, e = -1;
+            int d = -1;
+            uint64_t off = 0;
+            is >> l >> e >> d >> off;
+            if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_ || stride[(size_t) l] == 0 || d < 0 ||
+                d >= (int) paths.size() || d > 126 || off % 4096 != 0 || off >= (1ull << 56)) {
+                why = manifest + ": expert " + std::to_string(l) + "." + std::to_string(e) + " has no aligned place";
+                return false;
+            }
+            at[(size_t) (l * n_expert_ + e)] = ((int64_t) d << 56) | (int64_t) off;
+            ++listed;
+        }
+    }
+    if (paths.empty() || listed == 0) { why = manifest + " lists no drives or experts"; return false; }
+    std::vector<void*> hs;
+    for (const std::string& p : paths) {
+        const int wide = MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
+        if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, w.data(), wide);
+        HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+            for (void* x : hs) CloseHandle((HANDLE) x);
+            why = "cannot open " + p + " unbuffered";
+            return false;
+        }
+        hs.push_back(h);
+    }
+    dshadow_bytes_.reset(new std::atomic<uint64_t>[paths.size()]);
+    for (size_t i = 0; i < paths.size(); ++i) dshadow_bytes_[i] = 0;
+    dshadow_path_ = paths;
+    dshadow_h_ = hs;
+    dshadow_at_ = std::move(at);   // last: read_direct looks at this one
+    why = std::to_string(listed) + " experts over " + std::to_string(paths.size()) + " copies";
+    return true;
+#else
+    (void) manifest;
+    why = "Windows only";
+    return false;
+#endif
+}
+
+std::string FileExpertSource::take_decode_shadow_stats() {
+    std::string s;
+    for (size_t i = 0; i < dshadow_path_.size(); ++i) {
+        char b[64];
+        std::snprintf(b, sizeof b, "%s%c:%.2f GiB", i ? " " : "", dshadow_path_[i].empty() ? '?' : dshadow_path_[i][0],
+                      (double) dshadow_bytes_[i].exchange(0) / 1073741824.0);
+        s += b;
+    }
+    return s;
 }
 
 bool FileExpertSource::open_prompt_direct(std::string& why) {
@@ -2770,6 +2864,16 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
         if (f.dst == nullptr || f.layer < 0 || f.e < 0 || f.layer >= n_layers_ || f.e >= n_expert_) return false;
         if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range
             const uint64_t per = layer_blob_bytes_[(size_t) f.layer];
+            if (!dshadow_at_.empty() && tl_decode) {   // S-37: the decode reads this pair from its copy (aligned, skip 0)
+                const int64_t at = dshadow_at_[(size_t) (f.layer * n_expert_ + f.e)];
+                if (at >= 0) {
+                    const int d = (int) (at >> 56);
+                    const uint64_t a0 = (uint64_t) at & ((1ull << 56) - 1);
+                    sc.win.push_back({(int) direct_.size() + d, a0, (per + kSector - 1) / kSector * kSector, 0, per, 0, f.dst, 0, 0});
+                    dshadow_bytes_[(size_t) d].fetch_add(per, std::memory_order_relaxed);
+                    continue;
+                }
+            }
             const uint64_t off = layer_offsets_[(size_t) f.layer] + (uint64_t) f.e * per;
             const uint64_t a0 = off / kSector * kSector, a1 = (off + per + kSector - 1) / kSector * kSector;
             sc.win.push_back({0, a0, a1 - a0, off - a0, per, 0, f.dst, 0, 0});
@@ -2809,7 +2913,9 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({(HANDLE) (x.file < (int) direct_.size() ? direct_[(size_t) x.file]
+                                                                  : dshadow_h_[(size_t) x.file - direct_.size()]),
+                          x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;

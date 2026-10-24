@@ -894,6 +894,13 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// S-37 (fork, Windows, experts.bin, unbuffered): the decode's file-tier reads come from the S-21 copies the
+    /// manifest lists (every expert on one of several drives) instead of experts.bin, so a token's misses are read from
+    /// all the drives at once.  Only the decode thread's reads (DecodeScope) move; the load, the swaps and the prompt
+    /// path keep theirs.  The bytes are the same (make_shadow.py compares them).  False (and why) when not opened.
+    bool open_decode_shadow(const std::string& manifest, std::string& why);
+    /// S-37: bytes the decode read from each copy (drive letter, bytes), and resets them.
+    std::string take_decode_shadow_stats();
     /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
     /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
     /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the
@@ -1085,6 +1092,10 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    std::vector<void*> dshadow_h_;            ///< S-37: per copy, an unbuffered overlapped handle
+    std::vector<std::string> dshadow_path_;
+    std::vector<int64_t> dshadow_at_;         ///< S-37: per (layer, expert), copy << 56 | offset, -1 if not listed
+    mutable std::unique_ptr<std::atomic<uint64_t>[]> dshadow_bytes_;
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }

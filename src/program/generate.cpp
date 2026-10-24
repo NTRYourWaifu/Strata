@@ -8483,6 +8483,18 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: S-21 (STRATA_S21_SHADOW) is off: %s\n", serr.c_str());
             }
         }
+        // S-37 fork: STRATA_S37_DECODE_SHADOW=1 (with STRATA_S21_SHADOW): the decode's file-tier reads come from the
+        // same copies, every drive at once, instead of experts.bin (FileExpertSource::open_decode_shadow)
+        if (const char* dv = std::getenv("STRATA_S37_DECODE_SHADOW"); dv != nullptr && std::atoi(dv) != 0) {
+            const char* sv = std::getenv("STRATA_S21_SHADOW");
+            std::string serr;
+            if (sv != nullptr && sv[0] != '\0' && src.open_decode_shadow(sv, serr))
+                std::fprintf(stderr, "strata serve: S-37: the decode reads its file tier from the SSD copies in %s (%s)\n", sv,
+                             serr.c_str());
+            else
+                std::fprintf(stderr, "strata serve: S-37 (STRATA_S37_DECODE_SHADOW) is off: %s\n",
+                             sv == nullptr ? "STRATA_S21_SHADOW is not set" : serr.c_str());
+        }
         if (const char* hv = std::getenv("STRATA_PREFILL_HELPER_SOURCE"); hv != nullptr && std::atoi(hv) != 0 &&
             srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
             prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
@@ -17036,6 +17048,8 @@ int main(int argc, char** argv) {
             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
                 std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
                                      "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
+            if (const std::string ds = src.take_decode_shadow_stats(); !ds.empty())   // S-37, this request
+                std::fprintf(stderr, "strata serve: S-37 decode reads from the copies: %s\n", ds.c_str());
             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
                                      "%.1f ms per round (start to flip, between windows)",
