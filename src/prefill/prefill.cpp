@@ -1257,12 +1257,29 @@ const MmqPlan& mmq_plan() {
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
+        // H-67 (two packs): a resident expert's MMQ group takes the VRAM tier's formats (lm_experts) - a layer is on
+        // MMQ when both packs' formats are, and the group buffers hold either
+        const bool mixed = strata::kernels::cpu::gpu_layout_mixed();
+        if (mixed) {
+            const auto& gl = strata::kernels::cpu::gpu_expert_layout();
+            for (int64_t l = 0; on && l < layers; ++l) {
+                if (!p.layer[(size_t) l]) continue;
+                const int gt = gl.fmt[(size_t) l].gu_type, dt = gl.fmt[(size_t) l].d_type;
+                if (!mmq::fits(gt, 1280) || !mmq::fits(dt, N) || p.wmma_only[(size_t) l]) {
+                    p.layer[(size_t) l] = 0;
+                    p.fallback = true;
+                    continue;
+                }
+                p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
+                p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
+            }
+        }
         // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers
         // both products, gate/up reads nothing past its matrix, the down over-read fits the slot guard, and the blob
         // is exactly [gate | up | down] in MMQ's matrix sizes (the bytes a gather would copy)
         p.direct.assign(p.layer.size(), 0);
         p.d_over.assign(p.layer.size(), 0);
-        if (on && lay.native && mmq::direct_mode() == 1) {
+        if (on && lay.native && mmq::direct_mode() == 1 && !mixed) {
             int64_t nd = 0;
             for (int64_t l = 0; l < layers; ++l) {
                 if (!p.layer[(size_t) l]) continue;
@@ -5168,6 +5185,15 @@ bool lm_env() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LAYER_MAJOR"); return e && std::atoi(e) != 0; }();
     return v;
 }
+// H-67: every batched prompt layer-major, however short (one chunk is then one super-chunk) - with two packs always
+// (only lm_experts computes a resident expert in the VRAM tier's formats), else with STRATA_H67_LM_ALL=1 (the A/B)
+bool lm_force() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_H67_LM_ALL");
+        return strata::kernels::cpu::gpu_layout_mixed() || (e != nullptr && std::atoi(e) != 0);
+    }();
+    return v;
+}
 int64_t lm_tokens_env() {   // the super-chunk's target size (0: the default)
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_TOKENS"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
     return v;
@@ -5227,9 +5253,10 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     if (!m.grp_gu || !m.grp_d || !m.Xq || !m.GU || !m.H || !m.Hq || !m.Dm || !m.ids_identity || !m.tok_dev) {
         why = "the MoE buffers are missing"; return 0;
     }
-    // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
-    const int64_t min_s = lm_tokens_env() > 0 ? m.T : 2 * m.T;
-    if (n < min_s) { why = "a short prompt"; return 0; }
+    // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside; H-67's
+    // lm_force takes any prompt, its super-chunk then the prompt rounded up to a chunk)
+    const int64_t min_s = lm_tokens_env() > 0 || lm_force() ? m.T : 2 * m.T;
+    if (n < min_s && !lm_force()) { why = "a short prompt"; return 0; }
     const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env() : kLmDefaultTokens;
     int64_t S = std::max<int64_t>(min_s, want / m.T * m.T);
     S = std::min<int64_t>(S, (n + m.T - 1) / m.T * m.T);
@@ -5493,19 +5520,31 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 row_w[(size_t) p] = w_h[(size_t) i];
             }
         }
-        struct Entry { int32_t e, r0, nr; };
+        // H-67 (two packs): a resident expert's blob is the VRAM tier's (gpu_expert_layout), a streamed one the CPU
+        // pack's; one MMQ group takes one format, so where this layer's two formats differ a group never mixes the two
+        // (it ends where the residency changes; the products and the per-token sums are otherwise as before)
+        const strata::kernels::cpu::ExpertLayout& glay = strata::kernels::cpu::gpu_expert_layout();
+        bool split = false;
+        if (&glay != &lay && lay.native && glay.native) {
+            const auto& a = lay.fmt[(size_t) l];
+            const auto& b = glay.fmt[(size_t) l];
+            split = a.gu_type != b.gu_type || a.d_type != b.d_type || a.up_off != b.up_off || a.down_off != b.down_off ||
+                    a.bytes != b.bytes || a.tail_off != b.tail_off;
+        }
+        struct Entry { int32_t e, r0, nr; bool res; };
         std::vector<Entry> ents;
         for (int32_t e = 0; e < NE; ++e)
             for (int32_t r = off[(size_t) e]; r < off[(size_t) e + 1]; r += (int32_t) G)
-                ents.push_back({e, r, (int32_t) std::min<int64_t>(G, off[(size_t) e + 1] - r)});
-        struct Grp { size_t j0, j1; int32_t r0, nr, maxr; int64_t b_at, u_at, uo_at, nu; };
+                ents.push_back({e, r, (int32_t) std::min<int64_t>(G, off[(size_t) e + 1] - r), split && resident(e)});
+        struct Grp { size_t j0, j1; int32_t r0, nr, maxr; int64_t b_at, u_at, uo_at, nu; bool res; };
         std::vector<Grp> grps;
         for (size_t j = 0; j < ents.size();) {
             Grp gp{};
             gp.j0 = j;
             gp.r0 = ents[j].r0;
+            gp.res = ents[j].res;
             int32_t nr = 0, maxr = 0;
-            while (j < ents.size() && j - gp.j0 < (size_t) MMQ_GROUP && nr + ents[j].nr <= G) {
+            while (j < ents.size() && j - gp.j0 < (size_t) MMQ_GROUP && nr + ents[j].nr <= G && ents[j].res == gp.res) {
                 nr += ents[j].nr;
                 maxr = std::max(maxr, ents[j].nr);
                 ++j;
@@ -5606,14 +5645,23 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             lm_bytes += (uint64_t) lay.blob_bytes(l);
             return true;
         };
-        const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
-        const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-        const size_t mmq_gub = mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = mmq::matrix_bytes(mmq_dt, N, 640);
+        // the formats of group gi's experts (H-67: a resident group's are the VRAM tier's)
+        int mmq_gt = 42, mmq_dt = 42;
+        size_t mmq_gub = 0, mmq_db = 0;
+        const strata::kernels::cpu::NativeFmt* fmt = nullptr;
+        auto group_fmt = [&](const Grp& gp) {
+            fmt = lay.native ? &(gp.res ? glay : lay).fmt[(size_t) l] : nullptr;
+            mmq_gt = fmt ? fmt->gu_type : 42;
+            mmq_dt = fmt ? fmt->d_type : 42;
+            mmq_gub = mmq::matrix_bytes(mmq_gt, 1280, N);
+            mmq_db = mmq::matrix_bytes(mmq_dt, N, 640);
+        };
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
         size_t gi = 0;
         for (size_t j = 0; j < ents.size(); ++j) {
             const int32_t e = ents[j].e;
+            if (j == grps[gi].j0) group_fmt(grps[gi]);
             if (j == 0 || ents[j - 1].e != e) {   // the next expert: staged ahead, waited for, its blob located
                 if (j > 0) ++u;
                 while (staged < uniq.size() && staged <= u + (size_t) STAGE - 1) {
@@ -5634,7 +5682,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const size_t q = j - gp.j0;
             pt.mark(kPfDequant, cs);
             if (lay.native) {
-                const auto& f = lay.fmt[(size_t) l];
+                const auto& f = *fmt;
                 mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off, mmq_db,
                                    m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, cs);
             } else {
@@ -6221,7 +6269,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     }
 #endif
     if (impl_ && impl_->src) impl_->src->prompt_begin();   // S-15 fork (PairShadowSource)
-    if (lm_env() && hand_in_ == nullptr && impl_) {   // S-21 (fork): vizdatom's layer-major prefill
+    if ((lm_env() || lm_force()) && hand_in_ == nullptr && impl_) {   // S-21 (fork): vizdatom's layer-major prefill
         std::string why;
         if (lm_prepare(n, why) > 0) {
             const bool ok = run_layer_major(tokens, n, pos0, err);
@@ -6235,6 +6283,22 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             said = why;
             std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
         }
+    }
+    // H-67 (two packs): the default path would compute a resident expert in the CPU pack's formats - there every
+    // expert is streamed from the CPU pack instead (right, and slower: this prompt counts none as resident)
+    struct NoResident {
+        Impl* m = nullptr;
+        const int32_t* res = nullptr;
+        ~NoResident() { if (m) m->host_res = res; }
+    } no_resident;
+    if (strata::kernels::cpu::gpu_layout_mixed() && impl_ && impl_->host_res) {
+        no_resident.m = impl_.get();
+        no_resident.res = impl_->host_res;
+        impl_->host_res = nullptr;
+        static int64_t said = 0;
+        if (said++ < 3)
+            std::fprintf(stderr, "strata prefill: H-67: this prompt takes the default path, every expert streamed from the "
+                                 "CPU pack (none counted resident)\n");
     }
     const bool body_ok = run_impl(tokens, n, pos0, err);
 

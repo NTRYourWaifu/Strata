@@ -2047,10 +2047,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
+        // H-67: a VRAM group's blobs are the GPU tier's (gpu_expert_layout), a PCIe group's the host's (expert_layout)
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf,
+                           bool vram = true) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
-                const auto& f = lay.fmt[(size_t) l];
+                const auto& f = (vram ? strata::kernels::cpu::gpu_expert_layout() : lay).fmt[(size_t) l];
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
@@ -2096,7 +2098,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, /*vram=*/false);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);

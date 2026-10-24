@@ -94,6 +94,17 @@ const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
 /// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// H-67 mixed precision (STRATA_H67_CPU_PACK=<pack dir>): the VRAM tier holds the --pack's experts (IQ3_XXS) and the
+/// RAM / SSD tiers and the CPU pool another pack's (Q2_0 / IQ2_XS).  `expert_layout()` is then the CPU pack's - the
+/// arena, the file tier, the CPU pool and the prompt path's streamed experts ask it - and `gpu_expert_layout()` the
+/// --pack's, for everything that sizes, fills or computes a VRAM slot.  Without it the two are the same table.
+const ExpertLayout& gpu_expert_layout();
+bool gpu_layout_mixed();
+/// Loads `gpu_pack`'s layout as the GPU one, then `cpu_pack`'s as the process-wide one (call it instead of
+/// expert_layout_load).  Both native, same geometry, no Hadamard folding.
+bool expert_layout_load_mixed(const std::string& gpu_pack, const std::string& cpu_pack, int64_t n_layers,
+                              int64_t n_expert, std::string& err);
+
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,

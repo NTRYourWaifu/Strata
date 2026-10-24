@@ -19,9 +19,37 @@
 namespace strata::kernels::cpu {
 namespace {
 ExpertLayout g_layout;
+ExpertLayout g_gpu_layout;   // H-67: the VRAM tier's layout (only when g_mixed)
+bool g_mixed = false;
 }
 
 const ExpertLayout& expert_layout() { return g_layout; }
+const ExpertLayout& gpu_expert_layout() { return g_mixed ? g_gpu_layout : g_layout; }
+bool gpu_layout_mixed() { return g_mixed; }
+
+bool expert_layout_load_mixed(const std::string& gpu_pack, const std::string& cpu_pack, int64_t n_layers,
+                              int64_t n_expert, std::string& err) {
+    g_mixed = false;
+    if (!expert_layout_load(gpu_pack, n_layers, n_expert, err)) return false;
+    ExpertLayout gpu = g_layout;
+    const bool gpu_had = hadamard_spec().any();
+    if (!expert_layout_load(cpu_pack, n_layers, n_expert, err)) return false;
+    if (!gpu.native || !g_layout.native) {
+        err = "H-67: both packs must be native (IQ) packs";
+        return false;
+    }
+    if (gpu.n_expert != g_layout.n_expert || gpu.fmt.size() != g_layout.fmt.size()) {
+        err = "H-67: the two packs have different geometries";
+        return false;
+    }
+    if (gpu_had || hadamard_spec().any()) {
+        err = "H-67: Hadamard-folded packs are not supported in the mixed mode";
+        return false;
+    }
+    g_gpu_layout = std::move(gpu);
+    g_mixed = true;
+    return true;
+}
 
 int cpu_isa_cap() {
     // STRATA_FORCE_ISA (tests, the experimental older-CPU builds): the engine's own dispatch acts as if this CPU

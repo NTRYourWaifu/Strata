@@ -359,6 +359,280 @@ static const char* pipe_dbg_env(const char* name) {
     return on ? std::getenv(name) : nullptr;
 }
 
+// H-67 mixed precision: STRATA_H67_CPU_PACK names a second pack (Q2_0 / IQ2_XS) whose experts the RAM and SSD tiers
+// and the CPU pool use, while the VRAM tier keeps the --pack's (IQ3_XXS): a hot expert is computed in 3-bit on the
+// GPU, a cold one in 2-bit on the CPU.  Empty: off, the engine as before.
+const std::string& h67_cpu_pack() {
+    static const std::string p = [] { const char* v = std::getenv("STRATA_H67_CPU_PACK"); return std::string(v ? v : ""); }();
+    return p;
+}
+
+// H-67: the VRAM tier's blobs, read from the --pack's experts.bin - or with STRATA_H67_GPU_SHADOW=<manifest> from the
+// S-21 copies of that pack on several drives (the manifest's own format, every drive at once) - unbuffered on Windows
+// (no file-cache pages beside the RAM budget) into page-locked buffers that slot copies then read.  Up to kBatch blobs
+// are read at once, as overlapped requests.  Every other tier reads the CPU pack through the FileExpertSource, so
+// nothing here is shared with it.  One user at a time: the caller holds mu() over a read and the copies from it.
+class H67GpuBlobs {
+public:
+    static constexpr int kBatch = 32;
+    ~H67GpuBlobs() { close(); }
+    bool open(const std::string& pack, std::string& err) {
+        close();
+        const auto& lay = strata::kernels::cpu::gpu_expert_layout();
+        E_ = lay.n_expert;
+        const std::string path = pack + "/experts.bin";
+        files_.push_back(path);
+        uint64_t cap = lay.max_blob + 2 * kAlign;
+        if (const char* sv = std::getenv("STRATA_H67_GPU_SHADOW"); sv != nullptr && sv[0] != '\0') {
+            if (!load_manifest(sv, lay, cap, err)) return false;
+            shadow_ = sv;
+        }
+        cap_ = (size_t) ((cap + kAlign - 1) / kAlign * kAlign);
+        if (cudaHostAlloc((void**) &buf_, cap_ * kBatch, cudaHostAllocDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            buf_ = nullptr;
+#if defined(_WIN32)
+            buf_ = (uint8_t*) VirtualAlloc(nullptr, cap_ * kBatch, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            pageable_ = buf_ != nullptr;
+#endif
+            if (buf_ == nullptr) { err = "H-67: cannot allocate the VRAM tier's read buffers"; return false; }
+        }
+#if defined(_WIN32)
+        for (const std::string& f : files_) {
+            const int wide = MultiByteToWideChar(CP_UTF8, 0, f.c_str(), -1, nullptr, 0);
+            std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1));
+            if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, f.c_str(), -1, w.data(), wide);
+            HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+            if (h == INVALID_HANDLE_VALUE) { err = "H-67: cannot open " + f; return false; }
+            h_.push_back(h);
+        }
+        LARGE_INTEGER sz{};
+        if (!GetFileSizeEx(h_[0], &sz) || (uint64_t) sz.QuadPart != lay.total) {
+            err = "H-67: " + path + " is not the size the --pack's layout requires";
+            return false;
+        }
+        for (HANDLE& e : ev_) e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#else
+        fp_ = std::fopen(path.c_str(), "rb");
+        if (fp_ == nullptr) { err = "H-67: cannot open " + path; return false; }
+#endif
+        return true;
+    }
+    void close() {
+#if defined(_WIN32)
+        for (HANDLE h : h_) CloseHandle(h);
+        for (HANDLE& e : ev_) { if (e != nullptr) CloseHandle(e); e = nullptr; }
+#else
+        if (fp_ != nullptr) std::fclose(fp_);
+        fp_ = nullptr;
+#endif
+        h_.clear();
+        files_.clear();
+        place_.clear();
+        if (buf_ != nullptr) {
+#if defined(_WIN32)
+            if (pageable_) VirtualFree(buf_, 0, MEM_RELEASE);
+            else
+#endif
+            cudaFreeHost(buf_);
+        }
+        buf_ = nullptr;
+        pageable_ = false;
+    }
+    /// the blobs of n <= kBatch (layer, expert) pairs in the --pack's layout, all requested at once; out[k] stays valid
+    /// until the next read.  False with `err` on a failed read.
+    bool read_many(int n, const int32_t* layers, const int32_t* experts, const uint8_t** out, std::string& err) {
+        if (n <= 0) return true;
+        if (n > kBatch) { err = "H-67: too many blobs for one read"; return false; }
+        const auto& lay = strata::kernels::cpu::gpu_expert_layout();
+#if defined(_WIN32)
+        OVERLAPPED ov[kBatch] = {};
+        int file[kBatch];
+        DWORD want[kBatch];
+        uint64_t skip[kBatch];
+        for (int k = 0; k < n; ++k) {
+            const int64_t l = layers[k], e = experts[k];
+            uint64_t at = 0, len = 0;
+            if (!place_.empty()) {   // the manifest's copy: aligned already, its stride read whole
+                const Place& p = place_[(size_t) (l * E_ + e)];
+                file[k] = p.file;
+                at = p.off;
+                len = stride_[(size_t) l];
+                skip[k] = 0;
+            } else {
+                const uint64_t off = lay.blob_offset(l, e), nb = lay.blob_bytes(l);
+                at = off / kAlign * kAlign;
+                len = (off + nb + kAlign - 1) / kAlign * kAlign - at;
+                file[k] = 0;
+                skip[k] = off - at;
+            }
+            if (len > cap_) { err = "H-67: a blob outgrew the read buffers"; return false; }
+            want[k] = (DWORD) len;
+            ov[k].Offset = (DWORD) (at & 0xffffffffull);
+            ov[k].OffsetHigh = (DWORD) (at >> 32);
+            ov[k].hEvent = ev_[k];
+            if (!ReadFile(h_[(size_t) file[k]], buf_ + (size_t) k * cap_, want[k], nullptr, &ov[k]) &&
+                GetLastError() != ERROR_IO_PENDING) {
+                for (int q = 0; q < k; ++q) { DWORD g = 0; (void) GetOverlappedResult(h_[(size_t) file[q]], &ov[q], &g, TRUE); }
+                err = "H-67: reading layer " + std::to_string(l) + " expert " + std::to_string(e) + " failed";
+                return false;
+            }
+        }
+        bool ok = true;
+        for (int k = 0; k < n; ++k) {
+            DWORD got = 0;
+            if (!GetOverlappedResult(h_[(size_t) file[k]], &ov[k], &got, TRUE) ||
+                (uint64_t) got < skip[k] + lay.blob_bytes(layers[k])) {
+                if (ok) err = "H-67: reading layer " + std::to_string(layers[k]) + " expert " + std::to_string(experts[k]) + " failed";
+                ok = false;
+            }
+            out[k] = buf_ + (size_t) k * cap_ + skip[k];
+            bytes_ += lay.blob_bytes(layers[k]);
+        }
+        reads_ += n;
+        return ok;
+#else
+        for (int k = 0; k < n; ++k) {
+            const uint64_t off = lay.blob_offset(layers[k], experts[k]), nb = lay.blob_bytes(layers[k]);
+            uint8_t* b = buf_ + (size_t) k * cap_;
+            if (fseeko(fp_, (off_t) off, SEEK_SET) != 0 || std::fread(b, 1, (size_t) nb, fp_) != (size_t) nb) {
+                err = "H-67: reading layer " + std::to_string(layers[k]) + " expert " + std::to_string(experts[k]) + " failed";
+                return false;
+            }
+            out[k] = b;
+            bytes_ += nb;
+        }
+        reads_ += n;
+        return true;
+#endif
+    }
+    /// one blob (read_many of one)
+    const uint8_t* read(int64_t layer, int64_t expert, std::string& err) {
+        const int32_t l = (int32_t) layer, e = (int32_t) expert;
+        const uint8_t* b = nullptr;
+        return read_many(1, &l, &e, &b, err) ? b : nullptr;
+    }
+    /// the lent slots `lent` ((layer * n_expert + expert, slot) pairs) refilled with the --pack's blobs, a batch at a
+    /// time (queued copies, one wait per batch: the buffers are read again by the next), and marked resident in `res`
+    bool refill(strata::core::ExpertCache& cache, const std::vector<std::pair<int32_t, int32_t>>& lent, int32_t* res,
+                std::string& err) {
+        const std::lock_guard<std::mutex> lk(mu_);
+        const auto& lay = strata::kernels::cpu::gpu_expert_layout();
+        for (size_t at = 0; at < lent.size(); at += kBatch) {
+            const int n = (int) std::min<size_t>(kBatch, lent.size() - at);
+            int32_t ls[kBatch], es[kBatch];
+            const uint8_t* bs[kBatch];
+            for (int k = 0; k < n; ++k) {
+                ls[k] = lent[at + (size_t) k].first / (int32_t) E_;
+                es[k] = lent[at + (size_t) k].first % (int32_t) E_;
+            }
+            if (!read_many(n, ls, es, bs, err)) return false;
+            for (int k = 0; k < n; ++k)
+                if (!cache.fill_slot_queued(lent[at + (size_t) k].second, bs[k], err, (int64_t) lay.blob_bytes(ls[k]))) return false;
+            if (!cache.sync_queued(err)) return false;
+            for (int k = 0; k < n; ++k) res[(size_t) lent[at + (size_t) k].first] = lent[at + (size_t) k].second;
+        }
+        return true;
+    }
+    /// STRATA_H67_CHECK=1: slot `slot` read back and compared with the --pack's blob of (layer, expert) - true when equal
+    bool check_slot(strata::core::ExpertCache& cache, int32_t slot, int64_t layer, int64_t expert, std::string& err) {
+        const std::lock_guard<std::mutex> lk(mu_);
+        const uint8_t* b = read(layer, expert, err);
+        if (b == nullptr) return false;
+        std::vector<uint8_t> d((size_t) strata::kernels::cpu::gpu_expert_layout().blob_bytes(layer));
+        if (cudaMemcpy(d.data(), cache.device_slot(slot), d.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = std::string("H-67 check: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        return std::memcmp(d.data(), b, d.size()) == 0;
+    }
+    bool is_open() const { return buf_ != nullptr; }
+    std::mutex& mu() { return mu_; }
+    int64_t reads() const { return reads_.load(); }
+    uint64_t bytes() const { return bytes_.load(); }
+    const std::string& shadow() const { return shadow_; }
+    bool pageable() const { return pageable_; }
+    void note_check(bool ok) { ++checked_; if (!ok) ++bad_; }
+    int64_t checked() const { return checked_.load(); }
+    int64_t bad() const { return bad_.load(); }
+
+private:
+    // S-21's manifest (tools/make_shadow.py): "drive i weight path", "layer l blob stride offset" (this pack's blob and
+    // layer offset, checked), "x l e drive offset" (4 KiB aligned places)
+    bool load_manifest(const std::string& m, const strata::kernels::cpu::ExpertLayout& lay, uint64_t& cap, std::string& err) {
+        std::ifstream f(m);
+        if (!f) { err = "H-67: cannot read " + m; return false; }
+        const int64_t L = (int64_t) lay.fmt.size();
+        stride_.assign((size_t) L, 0);
+        place_.assign((size_t) (L * E_), Place{-1, 0});
+        std::string line;
+        while (std::getline(f, line)) {   // (files_[0] is experts.bin: drive i is files_[i + 1])
+            std::istringstream is(line);
+            std::string k;
+            is >> k;
+            if (k == "drive") {
+                int i = 0;
+                double wt = 0;
+                is >> i >> wt;
+                std::string p;
+                std::getline(is, p);
+                p.erase(0, p.find_first_not_of(' '));
+                files_.push_back(p);
+            } else if (k == "layer") {
+                int64_t l = 0, bb = 0, st = 0;
+                uint64_t off = 0;
+                is >> l >> bb >> st >> off;
+                if (l < 0 || l >= L || (uint64_t) bb != lay.blob_bytes(l) || off != lay.layer_offset(l) || st < bb ||
+                    st % (int64_t) kAlign != 0) {
+                    err = "H-67: " + m + ": layer " + std::to_string(l) + " is not the --pack's";
+                    return false;
+                }
+                stride_[(size_t) l] = (uint64_t) st;
+                cap = std::max<uint64_t>(cap, (uint64_t) st);
+            } else if (k == "x") {
+                int64_t l = -1, e = -1;
+                int d = -1;
+                uint64_t off = 0;
+                is >> l >> e >> d >> off;
+                if (l < 0 || l >= L || e < 0 || e >= E_ || d < 0 || off % kAlign != 0) {
+                    err = "H-67: " + m + ": a place is out of range";
+                    return false;
+                }
+                place_[(size_t) (l * E_ + e)] = Place{d + 1, off};
+            }
+        }
+        for (const Place& p : place_)
+            if (p.file < 1 || p.file >= (int) files_.size()) { err = "H-67: " + m + " does not place every expert"; return false; }
+        return true;
+    }
+    struct Place { int file; uint64_t off; };
+    static constexpr uint64_t kAlign = 4096;
+#if defined(_WIN32)
+    std::vector<HANDLE> h_;
+    HANDLE ev_[kBatch] = {};
+#else
+    std::vector<int> h_;
+    std::FILE* fp_ = nullptr;
+#endif
+    std::vector<std::string> files_;   // [0] the --pack's experts.bin, then the manifest's drives
+    std::vector<Place> place_;         // per (layer, expert): file index and offset (empty: experts.bin)
+    std::vector<uint64_t> stride_;
+    std::string shadow_;
+    int64_t E_ = 0;
+    uint8_t* buf_ = nullptr;
+    size_t cap_ = 0;
+    bool pageable_ = false;
+    std::mutex mu_;
+    std::atomic<int64_t> reads_{0}, checked_{0}, bad_{0};
+    std::atomic<uint64_t> bytes_{0};
+};
+// STRATA_H67_CHECK=1 (a test): adaptive swaps and lent-slot refills are read back and compared (H67GpuBlobs::check_slot)
+bool h67_check_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_H67_CHECK"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
@@ -3098,6 +3372,24 @@ int main(int argc, char** argv) {
         o.kv_grow = false;
         o.vram_elastic = false;
     }
+    // H-67 mixed precision: whatever moves an expert between the VRAM tier and the others carries one pack's bytes into
+    // the other's tier.  What knows the two packs: the asynchronous adaptive tier (`in` read from the --pack, `out`'s
+    // RAM bytes from the CPU pack's file), the refill of lent slots (from the --pack), the layer-major prompt path
+    // (resident experts in their own MMQ groups, in the --pack's formats; every batched prompt takes it).  What does
+    // not is off: the blocking adaptive tier (adapt() returns at once), the elastic K/V (it moves slots into RAM), the
+    // VRAM command.  STRATA_H67_WINDOWS=1: every prompt through the verify windows instead (the first step's reading).
+    if (!h67_cpu_pack().empty()) {
+        if (!o.net_connect.empty() || o.net_listen > 0 || !o.layer_split.empty()) {
+            std::fprintf(stderr, "strata generate: H-67 mixed precision runs on one PC and one GPU only\n");
+            return 2;
+        }
+        o.kv_grow = false;
+        o.vram_elastic = false;
+        static const bool windows = [] { const char* v = std::getenv("STRATA_H67_WINDOWS"); return v && v[0] == '1'; }();
+        if (windows) o.short_read = std::max<int64_t>(o.short_read, (int64_t) 1 << 40);
+        std::fprintf(stderr, "strata generate: H-67 mixed: no elastic K/V; %s\n",
+                     windows ? "every prompt read through the verify windows" : "batched prompts read layer-major");
+    }
     int64_t net_exact_slots = -1;   // STRATA_NET_EXACT: this PC's cache takes exactly this many profile pairs
     const int64_t net_lo = net_second ? o.net_split : 0;
     const int64_t net_hi = net_first ? o.net_split : -1;
@@ -3529,14 +3821,25 @@ int main(int argc, char** argv) {
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
         const strata::core::ModelGeometry g0;
-        if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
+        if (!h67_cpu_pack().empty()) {
+            if (!strata::kernels::cpu::expert_layout_load_mixed(o.pack, h67_cpu_pack(), g0.n_layers, g0.n_expert, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: H-67 mixed: the VRAM tier holds %s's experts (%.2f GiB in all), the "
+                                 "RAM / SSD tiers and the CPU pool %s's (%.2f GiB)\n", o.pack.c_str(),
+                         (double) strata::kernels::cpu::gpu_expert_layout().total / 1073741824.0, h67_cpu_pack().c_str(),
+                         (double) strata::kernels::cpu::expert_layout().total / 1073741824.0);
+        } else if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
         // anything is allocated: an unsupported down type used to exit from inside the first verify window, and
         // an unsupported dequant type left the prompt path's fp16 buffer unwritten.
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        // (H-67: both layouts - the VRAM tier computes the --pack's formats, the prompt path the CPU pack's)
+        for (int pass = 0; pass < (strata::kernels::cpu::gpu_layout_mixed() ? 2 : 1); ++pass) {
+        const auto& lay = pass == 0 ? strata::kernels::cpu::expert_layout() : strata::kernels::cpu::gpu_expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
@@ -3552,6 +3855,7 @@ int main(int argc, char** argv) {
             (void) strata::prefill::mmq::supported(f.gu_type);
             (void) strata::prefill::mmq::supported(f.d_type);
 #endif
+        }
         }
         // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;
         // GPU verify, remote GPUs, prompt FP16 path: hadamard_rows).  Validated end to end on CUDA (sm_86, sm_89 with
@@ -5781,7 +6085,8 @@ int main(int argc, char** argv) {
         src.set_gguf(o.native_preset);
         if (const char* v = std::getenv("STRATA_FETCH_THREADS"); v != nullptr && std::atoi(v) > 0)
             src.set_fetch_threads(std::atoi(v));
-        if (!src.open(o.pack, g.n_layers, g.n_expert, err)) {
+        // H-67: the file tier is the CPU pack's experts.bin (its layout is the process-wide one)
+        if (!src.open(h67_cpu_pack().empty() ? o.pack : h67_cpu_pack(), g.n_layers, g.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -5965,7 +6270,7 @@ int main(int argc, char** argv) {
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).
         strata::core::pin_reserve_take();
-        const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
+        const bool arena_ok = arena_src.open(h67_cpu_pack().empty() ? o.pack : h67_cpu_pack(), g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                                              o.shared_expert_arena);
         strata::core::pin_note_arena(arena_src.pinned_arena_bytes());
         strata::core::pin_sim_report("after the expert arena");
@@ -6077,6 +6382,20 @@ int main(int argc, char** argv) {
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
+    H67GpuBlobs h67_gpu;   // H-67: the VRAM tier's blobs (the --pack's), when the CPU tiers read another pack
+    if (strata::kernels::cpu::gpu_layout_mixed()) {
+        if (!stages.empty() || multi_gpu) {
+            std::fprintf(stderr, "strata generate: H-67 mixed precision runs on one GPU only\n");
+            return 2;
+        }
+        if (!h67_gpu.open(o.pack, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: H-67 mixed: the VRAM tier's blobs are read from %s, %d at a time%s\n",
+                     h67_gpu.shadow().empty() ? (o.pack + "/experts.bin").c_str() : h67_gpu.shadow().c_str(),
+                     H67GpuBlobs::kBatch, h67_gpu.pageable() ? " (pageable buffers: page-locking refused)" : "");
+    }
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
@@ -6170,7 +6489,7 @@ int main(int argc, char** argv) {
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        const int64_t blob = (int64_t) strata::kernels::cpu::gpu_expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
@@ -6255,7 +6574,7 @@ int main(int argc, char** argv) {
         free_b = strata::core::device_free_bytes(); (void) total_b;
         const int64_t prefill_mib = owned_prefill_mib();
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
-        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
+        const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::gpu_expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             // a WARNING that names the knob: the user asked for this size, and gets fewer slots
             std::fprintf(stderr, "strata generate: WARNING: layer split: --expert-cache %d leaves no room for the "
@@ -6275,7 +6594,7 @@ int main(int argc, char** argv) {
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = strata::kernels::cpu::gpu_expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * lay.max_blob;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
@@ -6301,7 +6620,7 @@ int main(int argc, char** argv) {
     } else if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
         free_b = strata::core::device_free_bytes(); (void) total_b;
-        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& lay = strata::kernels::cpu::gpu_expert_layout();
         // what the uniform sizing granted, in the 256-byte slots the loop below counts: the blob formats of 1280 / 2560
         // rows are whole multiples of 256 already; an NVFP4 blob's 16-byte scale tail is not, and the unrounded budget
         // held one slot fewer than asked (--expert-cache 1: none)
@@ -6362,7 +6681,7 @@ int main(int argc, char** argv) {
             if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
             if (per_layer_bytes > 0) {
                 // Cutting the list short would put one layer's blob in the next layer's range.
-                const auto& lay = strata::kernels::cpu::expert_layout();
+                const auto& lay = strata::kernels::cpu::gpu_expert_layout();
                 int64_t q = keep_bytes / (int64_t) per_layer_bytes;
                 if (q > g.n_expert) q = g.n_expert;
                 sized_slots.clear();
@@ -6383,13 +6702,13 @@ int main(int argc, char** argv) {
                 sized_slots.resize(keep);
                 o.expert_cache = (int) keep;
             } else {
-                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::expert_layout().max_blob);
+                o.expert_cache = (int) (keep_bytes / (int64_t) strata::kernels::cpu::gpu_expert_layout().max_blob);
             }
             if (o.expert_cache <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
             return true;
         };
         auto cache_bytes = [&]() -> int64_t {
-            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            if (sized_slots.empty()) return (int64_t) o.expert_cache * (int64_t) strata::kernels::cpu::gpu_expert_layout().max_blob;
             int64_t b = 0;
             for (const int64_t s : sized_slots) b += strata::core::ExpertCache::slot_stride(s, slot_guard);
             return b;
@@ -6410,7 +6729,7 @@ int main(int argc, char** argv) {
                 err = "ExpertCache: cudaMalloc failed: out of memory (STRATA_TEST_CACHE_FAIL)";
             } else {
                 ok = sized_slots.empty()
-                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::expert_layout().max_blob, err)
+                    ? xcache.open(o.expert_cache, g.n_layers, g.n_expert, (int64_t) strata::kernels::cpu::gpu_expert_layout().max_blob, err)
                     : xcache.open_sized(sized_slots, g.n_layers, g.n_expert, err);
             }
             if (!ok) {
@@ -6504,7 +6823,7 @@ int main(int argc, char** argv) {
         auto read_batch = [&](int64_t at) { src.prefetch_pairs(profile.data() + at, std::min<int64_t>(64, want - at)); };
         // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
         int64_t fill_ahead = 0;
-        if (!per_layer && srcp == &src && !src.unbuffered()) {
+        if (!per_layer && srcp == &src && !src.unbuffered() && !h67_gpu.is_open()) {
             const char* v = std::getenv("STRATA_FILL_AHEAD");
             fill_ahead = v == nullptr ? 256 : std::max(0, std::atoi(v));
             if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
@@ -6513,7 +6832,27 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
+        // H-67: the slots take the --pack's blobs, read here one at a time (the CPU pack's source is not asked)
+        const bool h67 = h67_gpu.is_open();
+        if (h67) fill_ahead = 0;
         for (int64_t i = 0; i < want; ++i) {
+            if (h67) {
+                const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (slot == strata::core::kNotResident) {
+                    if (per_layer) continue;
+                    break;
+                }
+                const uint8_t* b = h67_gpu.read(profile[(size_t) i].first, profile[(size_t) i].second, err);
+                const int64_t nb = (int64_t) strata::kernels::cpu::gpu_expert_layout().blob_bytes(profile[(size_t) i].first);
+                if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err, nb)) {
+                    std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n", (long long) i,
+                                 err.c_str());
+                    return 1;
+                }
+                fill_bytes += (uint64_t) nb;
+                ++prefilled;
+                continue;
+            }
             if (!per_layer && srcp == &src && src.unbuffered() && i % 64 == 0) {
                 if (ahead.valid()) ahead.get();
                 else read_batch(i);
@@ -6527,12 +6866,12 @@ int main(int argc, char** argv) {
             }
             const uint8_t* b = srcp->blob_stable(profile[(size_t) i].first, profile[(size_t) i].second);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::gpu_expert_layout().blob_bytes(profile[(size_t) i].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_bytes += strata::kernels::cpu::gpu_expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
@@ -6540,8 +6879,9 @@ int main(int argc, char** argv) {
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
         if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob_stable(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+                                h67 ? h67_gpu.read(profile[0].first, profile[0].second, err)
+                                    : srcp->blob_stable(profile[0].first, profile[0].second), err,
+                                (int64_t) strata::kernels::cpu::gpu_expert_layout().blob_bytes(profile[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -6556,7 +6896,7 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (const int32_t s = xcache.slot_of(l, e); s >= 0)
-                        sl.emplace_back(s, (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+                        sl.emplace_back(s, (int64_t) strata::kernels::cpu::gpu_expert_layout().blob_bytes(l));
             std::sort(sl.begin(), sl.end());
             std::vector<uint64_t> sh(sl.size(), 0);
             std::atomic<size_t> next_slot{0};
@@ -6902,7 +7242,7 @@ int main(int argc, char** argv) {
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
         drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
-        drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        drive.d.cache_blob = (int64_t) strata::kernels::cpu::gpu_expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
         drive.d.hit_scratch = hit_scratch;
         drive.d.parts_out = d_parts;
@@ -8738,7 +9078,7 @@ int main(int argc, char** argv) {
         // per layer), otherwise max_blob each.
         auto cache_slots_for = [&](const strata::core::ExpertCache& xc, uint64_t need) -> int64_t {
             return strata::program::split_lend_slots(xc.slots(), xc.bytes(), xc.slot_offsets(),
-                                                     (uint64_t) strata::kernels::cpu::expert_layout().max_blob, need);
+                                                     (uint64_t) strata::kernels::cpu::gpu_expert_layout().max_blob, need);
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
             return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr));
@@ -11142,6 +11482,7 @@ int main(int argc, char** argv) {
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
+            if (h67_gpu.is_open()) return true;   // H-67: only the asynchronous tier knows the two packs (adapt_tick)
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             // S-15 fork: with --pipeline-windows 2 the helper's cache stays as filled (its swaps copy into slots a window
             // in flight may read)
@@ -11491,20 +11832,65 @@ int main(int argc, char** argv) {
             AHome& h = ahomes[(size_t) w.home];
             const strata::core::OnDevice on(h.dev);
             if (const cudaError_t e = cudaMemcpyAsync(h.cache->device_slot(w.slot), b,
-                                                      (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer),
+                                                      (size_t) strata::kernels::cpu::gpu_expert_layout().blob_bytes(w.layer),
                                                       cudaMemcpyHostToDevice, h.stream); e != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: adaptive tier: copy of layer %d into slot %d (CUDA%d) failed: %s\n",
                              (int) w.layer, (int) w.slot, h.dev, cudaGetErrorString(e));
                 a_err = true;
             }
         };
+        // H-67, step 1: an exchanged `out` takes its RAM place in the CPU pack's bytes, read from that pack's file (its
+        // slot holds the --pack's, which no RAM tier may take)
+        auto a_h67_back = [&]() {
+            std::vector<int32_t> ls, es;
+            std::vector<uint8_t*> ds;
+            for (const ASwap& w : aswaps)
+                if (w.exchange) {
+                    ls.push_back(w.layer);
+                    es.push_back(w.out);
+                    ds.push_back(src.exchange_buffer(w.j, w.layer));
+                    if (ds.back() == nullptr) a_err = true;
+                }
+            if (!ls.empty() && !a_err.load() && !src.copy_blobs(ls.data(), es.data(), ds.data(), ls.size())) {
+                std::fprintf(stderr, "strata serve: adaptive tier (H-67): reading the evicted experts' CPU blobs failed\n");
+                a_err = true;
+            }
+        };
         auto a_choose = [&]() {   // step 1 on the job thread (the serial loop)
             a_pick();
             for (AHome& h : ahomes) h.used = false;
+            if (h67_gpu.is_open()) { a_h67_back(); return; }
             for (size_t hi = 0; hi < ahomes.size(); ++hi) a_back((int) hi);
         };
         auto a_copy_in = [&]() {   // step 2 on the job thread (the serial loop): each source read, then copied in
             std::vector<uint8_t> used(ahomes.size(), 0);
+            if (h67_gpu.is_open()) {   // H-67: `in` from the --pack, a batch of reads at a time (all drives at once)
+                const std::lock_guard<std::mutex> lk(h67_gpu.mu());
+                for (size_t i0 = a_lo; i0 < a_hi && !a_err.load(); i0 += H67GpuBlobs::kBatch) {
+                    const int n = (int) std::min<size_t>(H67GpuBlobs::kBatch, a_hi - i0);
+                    int32_t ls[H67GpuBlobs::kBatch], es[H67GpuBlobs::kBatch];
+                    const uint8_t* bs[H67GpuBlobs::kBatch];
+                    for (int k = 0; k < n; ++k) { ls[k] = aswaps[i0 + (size_t) k].layer; es[k] = aswaps[i0 + (size_t) k].in; }
+                    std::string re;
+                    if (!h67_gpu.read_many(n, ls, es, bs, re)) {
+                        std::fprintf(stderr, "strata serve: adaptive tier (H-67): %s\n", re.c_str());
+                        a_err = true;
+                        break;
+                    }
+                    for (int k = 0; k < n; ++k) {
+                        a_in_one(aswaps[i0 + (size_t) k], bs[k]);
+                        used[(size_t) aswaps[i0 + (size_t) k].home] = 1;
+                    }
+                    for (size_t hi = 0; hi < ahomes.size(); ++hi)   // the buffers are read again by the next batch
+                        if (used[hi]) {
+                            const strata::core::OnDevice on(ahomes[hi].dev);
+                            if (cudaStreamSynchronize(ahomes[hi].stream) != cudaSuccess) a_err = true;
+                        }
+                }
+                for (size_t hi = 0; hi < ahomes.size(); ++hi)
+                    if (used[hi]) a_mark(ahomes[hi]);
+                return;
+            }
             for (size_t i = a_lo; i < a_hi; ++i) {   // (the batch; all the round's swaps unless the arena caps it)
                 const ASwap& w = aswaps[i];
                 if (const uint8_t* b = a_from(w)) {
@@ -11565,6 +11951,32 @@ int main(int argc, char** argv) {
                 if (w.exchange) a_back_due[(size_t) w.home] = 1;
             astate = AState::CopyBack;
             for (int st = 0; st < (int) ahomes.size(); ++st) a_gap(st);
+        };
+        // STRATA_H67_CHECK=1 (a test): after each round its first swaps are checked - the slot holds `in`'s --pack blob,
+        // and an exchanged `out` is in RAM in its CPU pack's bytes (read again from that pack's experts.bin)
+        const bool h67_check = h67_check_on();
+        std::ifstream h67_cpu_file;
+        auto h67_check_round = [&]() {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            if (!h67_cpu_file.is_open()) h67_cpu_file.open(h67_cpu_pack() + "/experts.bin", std::ios::binary);
+            for (size_t i = 0; i < aswaps.size() && i < 4; ++i) {
+                const ASwap& w = aswaps[i];
+                std::string ce;
+                bool ok = h67_gpu.check_slot(*ahomes[(size_t) w.home].cache, w.slot, w.layer, w.in, ce);
+                if (w.exchange) {
+                    const uint8_t* r = src.resident_blob(w.layer, w.out);
+                    std::vector<char> fb((size_t) lay.blob_bytes(w.layer));
+                    h67_cpu_file.clear();
+                    h67_cpu_file.seekg((std::streamoff) lay.blob_offset(w.layer, w.out));
+                    h67_cpu_file.read(fb.data(), (std::streamsize) fb.size());
+                    ok = ok && r != nullptr && (bool) h67_cpu_file && std::memcmp(r, fb.data(), fb.size()) == 0;
+                }
+                h67_gpu.note_check(ok);
+                if (!ok) {
+                    std::fprintf(stderr, "strata serve: H-67 check: the swap of layer %d (in %d, out %d%s) is WRONG %s\n",
+                                 (int) w.layer, (int) w.in, (int) w.out, w.exchange ? ", exchanged" : "", ce.c_str());
+                }
+            }
         };
         // between windows: `drain` finishes the round in flight and starts none; `count` false (the pipelined loop
         // between verdicts) moves it on without counting a window.  False when a copy failed.
@@ -11692,6 +12104,7 @@ int main(int argc, char** argv) {
                     if (!a_ready(drain)) return true;
                     if (a_err.load()) return false;
                     if (!a_arena) src.commit_flip();
+                    if (h67_check && h67_gpu.is_open()) h67_check_round();
                     a_ms += std::chrono::duration<double, std::milli>(Clock::now() - a_t0).count();
                     aswaps.clear();
                     astate = AState::Idle;
@@ -14834,6 +15247,9 @@ int main(int argc, char** argv) {
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+                const int64_t rw_hits0 = drive.d.cache_hits;
+                const int64_t rw_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+                const int64_t rw_tail0 = drive.d.tail_experts;
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
@@ -14869,6 +15285,11 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    // STRATA_H67_READ_ADAPT=1 (H-67's yardstick, where a teacher-forced text is all prompt): the
+                    // asynchronous tier moves on at every window read here too, as in the decode loop - no slot is lent
+                    // while the windows read (the batched path refills its loan first), and the commit reads no slot
+                    static const bool read_adapt = [] { const char* v = std::getenv("STRATA_H67_READ_ADAPT"); return v && v[0] == '1'; }();
+                    if (read_adapt && ajob && !adapt_tick(false)) { e = "an adaptive refill failed"; return false; }
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -14886,6 +15307,16 @@ int main(int argc, char** argv) {
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
+                // the yardstick (STRATA_LOGPOS, H-67): the GPU share of the experts these windows looked up, and the
+                // missed ones the tail skip dropped (in neither count)
+                if (std::getenv("STRATA_LOGPOS") != nullptr) {
+                    const int64_t h = drive.d.cache_hits - rw_hits0;
+                    const int64_t l = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused - rw_look0;
+                    std::fprintf(stderr, "strata serve: read windows: GPU hit rate %.2f%% (%lld hits / %lld lookups), "
+                                         "%lld tail-skipped, %lld tokens\n", l > 0 ? 100.0 * (double) h / (double) l : 0.0,
+                                 (long long) h, (long long) l, (long long) (drive.d.tail_experts - rw_tail0),
+                                 (long long) (b - a));
+                }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
@@ -14906,6 +15337,18 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                if (h67_gpu.is_open()) {   // H-67: the lent slots take the --pack's blobs (a batch of reads at a time)
+                    if (!h67_gpu.refill(*p.cache, p.lent, host_res.data(), e)) return false;
+                    for (size_t k = 0; h67_check_on() && k < p.lent.size() && k < 4; ++k) {
+                        const auto [i, slot] = p.lent[k];
+                        std::string ce;
+                        const bool ok = h67_gpu.check_slot(*p.cache, slot, i / g.n_expert, i % g.n_expert, ce);
+                        h67_gpu.note_check(ok);
+                        if (!ok) std::fprintf(stderr, "strata serve: H-67 check: lent slot %d (layer %d expert %d) is WRONG %s\n",
+                                              (int) slot, (int) (i / g.n_expert), (int) (i % g.n_expert), ce.c_str());
+                    }
+                    return true;
+                }
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
@@ -17233,6 +17676,11 @@ int main(int argc, char** argv) {
                 else
                     std::fprintf(stderr, "\n");
             }
+            if (h67_gpu.is_open())
+                std::fprintf(stderr, "strata serve: H-67 mixed: %lld --pack blobs read (%.2f GiB) since the start%s\n",
+                             (long long) h67_gpu.reads(), (double) h67_gpu.bytes() / 1073741824.0,
+                             h67_check_on() ? (", check: " + std::to_string(h67_gpu.checked()) + " swaps / lent slots checked, " +
+                                               std::to_string(h67_gpu.bad()) + " wrong").c_str() : "");
             if (src.exchange_rotation())
                 std::fprintf(stderr, "strata serve: exchange rotation: %llu blocks, %llu host memcpy bytes avoided (cumulative payload)\n",
                              (unsigned long long)src.rotated_exchanges(),
@@ -17534,6 +17982,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         // refill the lent slots from the arena and give them back to the decode tier
+        if (!lent.empty() && h67_gpu.is_open()) {   // H-67: the lent slots take the --pack's blobs
+            if (!h67_gpu.refill(xcache, lent, host_res.data(), err)) {
+                std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
+                return 1;
+            }
+            res_put(d_res);
+            lent.clear();
+        }
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
             for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
@@ -17973,6 +18429,7 @@ int main(int argc, char** argv) {
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
         // routed clearly more often.  Copies run between rounds, when the GPU is idle.
         auto adapt = [&]() -> bool {
+            if (h67_gpu.is_open()) return true;   // H-67: the VRAM tier stays as the profile filled it here
             const Clock::time_point ta = Clock::now();
             ++adapt_rounds;
             // STRATA_TRACE_ADAPT: why an adapt round did or did not swap.  Default off, one getenv, and it
