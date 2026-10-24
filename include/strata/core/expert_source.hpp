@@ -840,6 +840,13 @@ public:
     /// windows, with no adaptive round in flight.  A failed read leaves the copy as it was.  Not with
     /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
     bool replace_resident(int64_t layer, int64_t in, int64_t out);
+    /// S-40 (--kv-grow under --resident-budget-gib): replace_resident with `in`'s bytes given (copied back from the GPU
+    /// slot it leaves) instead of read from the file.  The same rules.
+    bool adopt_resident(int64_t layer, int64_t in, int64_t out, const uint8_t* src) {
+        return install_resident(layer, in, out, src);
+    }
+    /// S-40 check (STRATA_S40_VERIFY=1): the blob's bytes as the files hold them, whatever the RAM copy holds.
+    bool file_blob(int64_t layer, int64_t expert, uint8_t* dst) const { return copy_from_files(layer, expert, dst); }
     int64_t ram_adapts() const { return ram_adapts_; }
     // ---- 149-prefetch (STRATA_RAM_ADAPT2): the same promotion, staged.  `ram_stage` queues the read of `in` on an I/O thread
     // (false: already queued, the queue is full, or no compact copy); `ram_install` - called by the decode thread at a window
