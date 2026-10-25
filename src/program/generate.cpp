@@ -10365,8 +10365,10 @@ int main(int argc, char** argv) {
             return use_mtp && k == dc_n ? &mtp.kv_state() : nullptr;
         };
         if (!o.disk_cache.empty() && !net_second) {
+            // (fork, 10-25) --vision is allowed: every read and write below already skips a request or a conversation
+            // with pictures (req_imgs / live_imgs), so text conversations keep their SSD snapshots
             const char* why = o.prompt_cache <= 0 ? "it needs --prompt-cache > 0" : o.batch > 0 ? "not with --batch"
-                            : o.peer_device >= 1 ? "not with --peer-device" : o.vision ? "not with --vision"
+                            : o.peer_device >= 1 ? "not with --peer-device"
                             : o.kv_grow && !s40_env() ? "not with --kv-grow" : nullptr;
             std::string de;
             if (why == nullptr && !session_identity(dc_id, de, [] { strata::core::progress_beat(); })) why = de.c_str();
