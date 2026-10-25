@@ -5213,7 +5213,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     const core::ModelGeometry& g = *m.g;
     if (stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr || hand_in_ != nullptr) { why = "a layer split"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
-    if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
+    // (S-42, fork: an image prompt too - its picture rows go in at layer 0 as run_impl's do, and the rope kernels read
+    // the pictures' positions from the M-RoPE table in either path)
     // run_impl's debug hooks on the routing and the rows have no layer-major form
     if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
         why = "a routing or row debug dump";
@@ -5742,7 +5743,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         batched = false;
                     for (int64_t t = 0; batched && t < T; ++t) {
                         const int64_t tok = tokens[c0 + t];
-                        if (tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                        if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
                         else m.tok_host[(size_t) t] = (int32_t) tok;
                     }
                     if (batched) {
@@ -5763,8 +5764,32 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                                   (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, cs);
                         }
                     }
-                    for (int64_t t = 0; !batched && t < T; ++t)
-                        if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, cs, err)) return false;
+                    for (int64_t t = 0; !batched && t < T;) {
+                        const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
+                        if (row) {   // S-42: a picture's rows, as run_impl uploads them (#1996: a run in one pinned copy)
+                            const int64_t row_bytes = N * 4, run_max = std::max<int64_t>(1, (4 << 20) / row_bytes);
+                            int64_t t1 = t + 1;
+                            while (t1 < T && t1 - t < run_max && embd_rows[p0 + t1]) ++t1;
+                            void* stage = m.up_ring.acquire((size_t) ((t1 - t) * row_bytes));
+                            cudaError_t e = cudaSuccess;
+                            if (stage != nullptr) {
+                                for (int64_t r = t; r < t1; ++r)
+                                    std::memcpy((char*) stage + (size_t) ((r - t) * row_bytes), embd_rows[p0 + r], (size_t) row_bytes);
+                                e = m.up_ring.submit(m.emb + t * N, stage, (size_t) ((t1 - t) * row_bytes), cs);
+                            } else {
+                                for (int64_t r = t; r < t1 && e == cudaSuccess; ++r)
+                                    e = core::PinnedRing::direct(m.emb + r * N, embd_rows[p0 + r], (size_t) row_bytes, cs);
+                            }
+                            if (e != cudaSuccess) {
+                                err = "prefill (layer-major): the image embedding upload failed";
+                                return false;
+                            }
+                            t = t1;
+                        } else {
+                            if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, cs, err)) return false;
+                            ++t;
+                        }
+                    }
                     gr_broadcast(m.emb, m.R, T, cs);
                     if (ple_on && !ple_next.valid())
                         ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {

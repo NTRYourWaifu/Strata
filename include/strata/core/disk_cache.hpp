@@ -6,7 +6,11 @@
 // checkpoint lengths the files hold, the identity it was written with) and one session file per GPU stage on this PC
 // (<key>.s0, <key>.s1, ...; conversation_file.hpp's format).  A split across two PCs keeps the other PC's layers in
 // <key>.net on that PC.  Pure host code: no CUDA.
+// S-42 (fork): a conversation with pictures is written too - its <|image_pad|> tokens are the same for any picture, so
+// the record keeps the pictures' keys (where each starts, its hash) and a prompt matches only with the same pictures.
 #pragma once
+
+#include "strata/core/conversation_cache.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -23,6 +27,7 @@ struct DiskSnapshot {
     bool cvec = true;                ///< the control vector's state the snapshot was read with
     std::vector<int32_t> ids;        ///< the snapshot's tokens (its live state is at ids.size())
     std::vector<int64_t> cks;        ///< the checkpoints the files hold (prefixes of ids), shortest first
+    std::vector<ConversationImageKey> imgs;   ///< S-42: the pictures in ids (empty: text only)
     uint64_t bytes = 0;              ///< this PC's files
     uint64_t remote_bytes = 0;       ///< the other PC's file (0: none)
     int64_t used = 0;                ///< last written or read (ms since the epoch): the eviction order
@@ -32,8 +37,10 @@ struct DiskSnapshot {
 enum DiskKind : int32_t { kDiskTurn = 0, kDiskRoot = 1, kDiskSwitch = 2, kDiskStop = 3 };
 const char* disk_kind_name(int32_t kind);
 
-/// The snapshot's name: the token ids and the control vector's state, hashed.
-std::string disk_snapshot_key(const std::vector<int32_t>& ids, bool cvec);
+/// The snapshot's name: the token ids, the control vector's state and (S-42) the pictures, hashed.  Without pictures
+/// the name is the one a text snapshot always had.
+std::string disk_snapshot_key(const std::vector<int32_t>& ids, bool cvec,
+                              const std::vector<ConversationImageKey>& imgs = {});
 int64_t disk_now_ms();
 
 class DiskCache {
@@ -49,15 +56,16 @@ public:
 
     /// The snapshot that gives `prompt` the most tokens: its live state when its ids are a prefix of the prompt
     /// shorter than it, else its deepest checkpoint that is.  Only snapshots of this identity, layout and control
-    /// vector state count.  -1 when none; `resume` is the tokens it gives.  Ties: the smaller files.
-    int best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model, uint64_t config, const std::string& layout,
-             int64_t& resume) const;
+    /// vector state count, and (S-42) only where the pictures below that point are the prompt's `prompt_imgs`.
+    /// -1 when none; `resume` is the tokens it gives.  Ties: the smaller files.
+    int best(const std::vector<int64_t>& prompt, const std::vector<ConversationImageKey>& prompt_imgs, bool cvec,
+             uint64_t model, uint64_t config, const std::string& layout, int64_t& resume) const;
     /// S-7 (fork): the same, with the config fingerprints `config_ok` accepts (given the snapshot's token count).
-    int best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model,
-             const std::function<bool(uint64_t config, size_t tokens)>& config_ok, const std::string& layout,
-             int64_t& resume) const;
-    /// The snapshot with exactly these ids and control vector state (any identity), or -1.
-    int find(const std::vector<int32_t>& ids, bool cvec) const;
+    int best(const std::vector<int64_t>& prompt, const std::vector<ConversationImageKey>& prompt_imgs, bool cvec,
+             uint64_t model, const std::function<bool(uint64_t config, size_t tokens)>& config_ok,
+             const std::string& layout, int64_t& resume) const;
+    /// The snapshot with exactly these ids, pictures and control vector state (any identity), or -1.
+    int find(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const;
     /// Writes <key>.meta (through a temporary file) and adds or replaces the entry.
     bool put(DiskSnapshot s, std::string& err);
     /// Marks it used now (its .meta rewritten).

@@ -10365,8 +10365,8 @@ int main(int argc, char** argv) {
             return use_mtp && k == dc_n ? &mtp.kv_state() : nullptr;
         };
         if (!o.disk_cache.empty() && !net_second) {
-            // (fork, 10-25) --vision is allowed: every read and write below already skips a request or a conversation
-            // with pictures (req_imgs / live_imgs), so text conversations keep their SSD snapshots
+            // (fork, 10-25) --vision is allowed.  S-42: a conversation with pictures is written and read back too - the
+            // snapshot keeps its pictures' keys (where each starts, its hash) and matches only a prompt with the same ones
             const char* why = o.prompt_cache <= 0 ? "it needs --prompt-cache > 0" : o.batch > 0 ? "not with --batch"
                             : o.peer_device >= 1 ? "not with --peer-device"
                             : o.kv_grow && !s40_env() ? "not with --kv-grow" : nullptr;
@@ -10409,24 +10409,26 @@ int main(int argc, char** argv) {
                              keys.size() == 1 ? "" : "s", e.c_str());
         };
         // the deepest checkpoint short of `ids` (a prefix of it), or null
-        auto dc_deepest = [&](const std::vector<int32_t>& ids) -> const ConvCheckpoint* {
+        auto dc_deepest = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) -> const ConvCheckpoint* {
             const ConvCheckpoint* best = nullptr;
             for (const ConvCheckpoint& c : checks)
-                if (c.ids.size() < ids.size() && (best == nullptr || c.ids.size() > best->ids.size()) && c.imgs.empty() &&
-                    std::equal(c.ids.begin(), c.ids.end(), ids.begin()))
+                if (c.ids.size() < ids.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
+                    c.imgs == imgs_below(imgs, (int64_t) c.ids.size()) && std::equal(c.ids.begin(), c.ids.end(), ids.begin()))
                     best = &c;
             return best;
         };
         // Writes a snapshot of `sids` (a prefix of the session's tokens, its K/V up to there): its running state is the
         // live session's (`from` null: sids is `live`) or checkpoint `from`'s; the file keeps checkpoint `keep` too.
-        auto dc_save = [&](int32_t kind, const std::vector<int32_t>& sids, const ConvCheckpoint* from,
-                           const ConvCheckpoint* keep) {
+        // S-42: `simgs` are the pictures in sids (the checkpoints' own are in theirs)
+        auto dc_save = [&](int32_t kind, const std::vector<int32_t>& sids, const std::vector<ImgKey>& simgs,
+                           const ConvCheckpoint* from, const ConvCheckpoint* keep) {
             if (!dcache.on() || sids.empty()) return;
-            if (const int f = dcache.find(sids, cvec_cached); f >= 0) { dcache.touch((size_t) f); return; }
+            if (net_link && !simgs.empty()) return;   // the other PC's part carries no picture keys (pictures: one PC)
+            if (const int f = dcache.find(sids, simgs, cvec_cached); f >= 0) { dcache.touch((size_t) f); return; }
             if ((from != nullptr && from->stage_parts.size() != dc_n) || (keep != nullptr && keep->stage_parts.size() != dc_n))
                 return;   // a checkpoint without every stage's part: not one this cache can write
             const auto t0 = Clock::now();
-            const std::string key = strata::core::disk_snapshot_key(sids, cvec_cached);
+            const std::string key = strata::core::disk_snapshot_key(sids, cvec_cached, simgs);
             const int64_t L = (int64_t) sids.size();
             std::string e;
             bool remote = false;
@@ -10465,8 +10467,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 const ConvCheckpoint* lf = from == nullptr ? nullptr : k == 0 ? from : &from->stage_parts[k - 1];
-                const std::vector<ImgKey> no_imgs;
-                const strata::core::ConversationView view{sids, no_imgs, ck, cvec_cached};
+                const strata::core::ConversationView view{sids, simgs, ck, cvec_cached};
                 strata::core::SavedConversation meta;
                 std::vector<strata::core::SessionKvSource> src;
                 strata::core::SessionWriteOptions wo;
@@ -10518,6 +10519,7 @@ int main(int argc, char** argv) {
             s.kind = kind;
             s.cvec = cvec_cached;
             s.ids = sids;
+            s.imgs = simgs;
             if (keep != nullptr) s.cks.push_back((int64_t) keep->ids.size());
             s.bytes = bytes;
             s.remote_bytes = rbytes;
@@ -10530,24 +10532,28 @@ int main(int argc, char** argv) {
             }
             const auto gone = dcache.trim(key);
             dc_drop_remote(gone);
-            std::fprintf(stderr, "strata serve: disk cache: wrote %s (%s, %lld tokens%s) in %.0f ms: %.1f MB here%s; %zu "
+            const std::string pics = simgs.empty() ? std::string()
+                                     : ", " + std::to_string(simgs.size()) + (simgs.size() == 1 ? " picture" : " pictures");
+            std::fprintf(stderr, "strata serve: disk cache: wrote %s (%s, %lld tokens%s%s) in %.0f ms: %.1f MB here%s; %zu "
                                  "snapshots, %.2f GiB here%s\n", key.c_str(), strata::core::disk_kind_name(kind),
-                         (long long) L, keep != nullptr ? (", checkpoint at " + std::to_string(keep->ids.size())).c_str() : "",
+                         (long long) L, pics.c_str(),
+                         keep != nullptr ? (", checkpoint at " + std::to_string(keep->ids.size())).c_str() : "",
                          ms, (double) bytes / 1e6,
                          remote ? (" + " + std::to_string((int64_t) (rbytes / 1000000)) + " MB on the other PC").c_str() : "",
                          dcache.entries().size(), (double) dcache.dir_bytes() / 1073741824.0,
                          gone.empty() ? "" : ("; " + std::to_string(gone.size()) + " old ones deleted").c_str());
         };
-        // Reads back the snapshot that gives `rids` the most tokens, when that beats the RAM cache's `ram_resume` by
+        // Reads back the snapshot that gives `rids` (with pictures `rimgs`, S-42) the most tokens, when that beats the RAM
+        // cache's `ram_resume` by
         // --disk-cache-min-gain.  1: the session (and the other PC's) is the snapshot now, `live` and `checks` its
         // tokens and checkpoints; 0: nothing changed, or the session was reset (read from token 0); -1: a transfer
         // failed after the GPUs' state was touched (the caller ends the engine, as for a parked conversation).
         // S-40: `room(cells)` makes the elastic K/V (--kv-grow) map the snapshot's cells before they are written
-        auto dc_restore = [&](const std::vector<int64_t>& rids, bool want_cv, int64_t ram_resume,
-                              const std::function<bool(int64_t)>& room) -> int {
+        auto dc_restore = [&](const std::vector<int64_t>& rids, const std::vector<ImgKey>& rimgs, bool want_cv,
+                              int64_t ram_resume, const std::function<bool(int64_t)>& room) -> int {
             if (!dcache.on()) return 0;
             int64_t cand = 0;
-            const int bi = dcache.best(rids, want_cv, dc_id.model, config_ok, dc_layout, cand);
+            const int bi = dcache.best(rids, rimgs, want_cv, dc_id.model, config_ok, dc_layout, cand);
             if (bi < 0 || cand < ram_resume + o.disk_cache_min_gain) return 0;
             const strata::core::DiskSnapshot snap = dcache.at((size_t) bi);
             // a failed growth may leave the tier half-changed: the engine stops (as for the prompt's own growth)
@@ -10608,7 +10614,10 @@ int main(int argc, char** argv) {
                 const strata::core::SessionKvSinks sinks = [&](const strata::core::SavedConversation& meta,
                                                                std::vector<strata::core::SessionKvSink>& out,
                                                                std::string& why) {
-                    if (meta.live.ids != snap.ids) { why = "its tokens differ from the index"; return false; }
+                    if (meta.live.ids != snap.ids || meta.live.imgs != snap.imgs) {
+                        why = "its tokens or pictures differ from the index";
+                        return false;
+                    }
                     if (!touched_here) reset();   // committed: the K/V below overwrites the session's
                     return strata::core::conversation_snapshot_sinks(out, meta, dc_ss(k), g, dc_draft(k), why);
                 };
@@ -10647,7 +10656,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: disk cache: not reading %s back: %s%s\n", snap.key.c_str(),
                              !ok ? e.c_str() : re.c_str(),
                              touched_here || touched_there ? "; reading the prompt from token 0" : "");
-                const int at = dcache.find(snap.ids, snap.cvec);
+                const int at = dcache.find(snap.ids, snap.imgs, snap.cvec);
                 if ((gone || (!rok && re.find("RAM") == std::string::npos)) && at >= 0) {   // a broken or missing part
                     dcache.drop((size_t) at);
                     dc_drop_remote({snap.key});
@@ -10679,7 +10688,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
             live = std::move(img[0].live.ids);
-            live_imgs.clear();
+            live_imgs = std::move(img[0].live.imgs);   // S-42 (empty for a text snapshot)
             if (dc_n == 0) {
                 checks = std::move(img[0].checkpoints);
             } else {   // each checkpoint gets its later stages' parts back
@@ -10693,7 +10702,7 @@ int main(int argc, char** argv) {
             tail_ckpt_len = -1;
             cvec_cached = snap.cvec;
             live_ok = true;
-            if (const int at = dcache.find(snap.ids, snap.cvec); at >= 0) dcache.touch((size_t) at);
+            if (const int at = dcache.find(snap.ids, snap.imgs, snap.cvec); at >= 0) dcache.touch((size_t) at);
             const auto twin = ctx_twins.find(snap.config);
             std::fprintf(stderr, "strata serve: disk cache: read back %s (%s, %lld tokens, gives this prompt %lld; the RAM "
                                  "cache had %lld%s) in %.0f ms (files %.0f ms, %.1f MB here)\n", snap.key.c_str(),
@@ -13628,17 +13637,16 @@ int main(int argc, char** argv) {
                 if (!dcache.on()) what = "no disk cache";
                 else if (!dc_live_disk) what = "the last request asked for no disk (strata_disk false)";
                 else if (!live_ok || live.empty()) what = "nothing live";
-                else if (!live_imgs.empty()) what = "the conversation has pictures";
                 else if ((int64_t) live.size() < o.disk_cache_min_tokens) what = "shorter than --disk-cache-min-tokens";
-                else if (dcache.find(live, cvec_cached) >= 0) what = "already on the SSD";
+                else if (dcache.find(live, live_imgs, cvec_cached) >= 0) what = "already on the SSD";
                 int64_t wrote = 0;
                 if (what == nullptr) {
                     if (!ver.wait_commit(err)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
-                    dc_save(strata::core::kDiskStop, live, nullptr, dc_deepest(live));
-                    const int f = dcache.on() ? dcache.find(live, cvec_cached) : -1;
+                    dc_save(strata::core::kDiskStop, live, live_imgs, nullptr, dc_deepest(live, live_imgs));
+                    const int f = dcache.on() ? dcache.find(live, live_imgs, cvec_cached) : -1;
                     wrote = f >= 0 ? (int64_t) live.size() : 0;
                     what = f >= 0 ? "written" : "writing failed (see the log)";
                 }
@@ -14194,13 +14202,13 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks)
                         if ((int64_t) c.ids.size() > dc_ram && starts_with(c.ids, c.imgs)) dc_ram = (int64_t) c.ids.size();
                 }
-                if (o.disk_cache_switch && dc_live_disk && !dc_cont && live_ok && live_imgs.empty() &&
+                if (o.disk_cache_switch && dc_live_disk && !dc_cont && live_ok &&
                     (int64_t) live.size() >= o.disk_cache_min_tokens) {
                     if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
-                    dc_save(strata::core::kDiskSwitch, live, nullptr, dc_deepest(live));
+                    dc_save(strata::core::kDiskSwitch, live, live_imgs, nullptr, dc_deepest(live, live_imgs));
                 }
-                if (req_imgs.empty() &&
-                    dc_restore(ids, want_cvec, dc_ram, [&](int64_t c) { return kvg_ensure(c + 256, kv_quiesce); }) < 0)
+                if (dc_restore(ids, req_imgs, want_cvec, dc_ram,
+                               [&](int64_t c) { return kvg_ensure(c + 256, kv_quiesce); }) < 0)
                     return 1;
             }
             int64_t resume = 0;
@@ -17378,19 +17386,19 @@ int main(int argc, char** argv) {
             // S-6 (fork): a Stop - while the prompt was read (`cancelled`, what was read kept live above) or while
             // the reply was written - ends the turn here: the user may unload next, and what is only in RAM is gone
             const bool stopped = cancelled || std::strcmp(finish, "cancel") == 0;
-            if (dcache.on() && req_disk && !nf_hit && req_imgs.empty()) {
+            if (dcache.on() && req_disk && !nf_hit) {   // (S-42: with pictures too)
                 if (root_at > 0)   // (a Stop past the root still read it whole)
                     for (const ConvCheckpoint& c : checks)
                         if ((int64_t) c.ids.size() == root_at) {
-                            dc_save(strata::core::kDiskRoot, c.ids, &c, nullptr);
+                            dc_save(strata::core::kDiskRoot, c.ids, c.imgs, &c, nullptr);
                             break;
                         }
                 bool tool = false;
                 for (size_t i = (size_t) std::min<int64_t>(n, (int64_t) live.size()); i < live.size() && !tool; ++i)
                     tool = live[i] == o.disk_cache_skip_token;
-                const bool keep = live_ok && live_imgs.empty() && (int64_t) live.size() >= o.disk_cache_min_tokens;
+                const bool keep = live_ok && (int64_t) live.size() >= o.disk_cache_min_tokens;
                 if (!cancelled && !tool) {   // a turn's end (a Stop in a reply without a tool call too, as before)
-                    if (keep) dc_save(strata::core::kDiskTurn, live, nullptr, dc_deepest(live));
+                    if (keep) dc_save(strata::core::kDiskTurn, live, live_imgs, nullptr, dc_deepest(live, live_imgs));
                 } else if (!stopped) {
                     std::fprintf(stderr, "strata serve: disk cache: the reply calls a tool (mid-turn): not written\n");
                 } else if (keep) {
@@ -17398,9 +17406,9 @@ int main(int argc, char** argv) {
                     std::vector<int64_t> l64(live.begin(), live.end());
                     l64.push_back(-1);   // best() wants a prompt longer than the snapshot
                     int64_t have = 0;
-                    dcache.best(l64, cvec_cached, dc_id.model, dc_id.config, dc_layout, have);
+                    dcache.best(l64, live_imgs, cvec_cached, dc_id.model, dc_id.config, dc_layout, have);
                     if ((int64_t) live.size() >= have + o.disk_cache_min_gain)
-                        dc_save(strata::core::kDiskStop, live, nullptr, dc_deepest(live));
+                        dc_save(strata::core::kDiskStop, live, live_imgs, nullptr, dc_deepest(live, live_imgs));
                     else
                         std::fprintf(stderr, "strata serve: disk cache: stopped at %lld tokens, the SSD already gives "
                                              "%lld: not written\n", (long long) live.size(), (long long) have);

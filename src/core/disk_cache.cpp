@@ -14,7 +14,9 @@ namespace {
 namespace fs = std::filesystem;
 
 constexpr char kMagic[8] = {'S', 'T', 'R', 'D', 'C', 'M', '0', '1'};
-constexpr uint32_t kVersion = 1;
+// version 2 (S-42, fork): the record ends with the pictures' keys.  A text snapshot is still written as version 1, so an
+// older engine keeps reading those (it deletes only the ones with pictures)
+constexpr uint32_t kVersion = 1, kVersionImages = 2;
 constexpr uint64_t kFnvBasis = 1469598103934665603ull;
 
 uint64_t fnv(const void* p, size_t n, uint64_t h) {
@@ -101,7 +103,8 @@ bool read_meta(const fs::path& p, DiskSnapshot& s) {
     uint32_t ver = 0, ll = 0;
     int32_t cvec = 1;
     uint64_t n = 0;
-    if (!r.raw(magic, 8) || !r.get(ver) || ver != kVersion || !r.get(s.model) || !r.get(s.config) || !r.get(ll) ||
+    if (!r.raw(magic, 8) || !r.get(ver) || (ver != kVersion && ver != kVersionImages) || !r.get(s.model) ||
+        !r.get(s.config) || !r.get(ll) ||
         ll > r.left())
         return false;
     s.layout.assign(ll, '\0');
@@ -112,7 +115,14 @@ bool read_meta(const fs::path& p, DiskSnapshot& s) {
     s.ids.resize((size_t) n);
     if (!r.raw(s.ids.data(), (size_t) n * 4) || !r.get(n) || n > r.left() / 8) return false;
     s.cks.resize((size_t) n);
-    if (!r.raw(s.cks.data(), (size_t) n * 8) || r.left() != 8) return false;
+    if (!r.raw(s.cks.data(), (size_t) n * 8)) return false;
+    if (ver == kVersionImages) {
+        if (!r.get(n) || n > r.left() / 16 || n == 0) return false;
+        s.imgs.resize((size_t) n);
+        for (ConversationImageKey& k : s.imgs)
+            if (!r.get(k.start) || !r.get(k.hash) || k.start < 0 || k.start >= (int64_t) s.ids.size()) return false;
+    }
+    if (r.left() != 8) return false;
     for (int64_t c : s.cks)
         if (c < 1 || c > (int64_t) s.ids.size()) return false;
     s.key = key_of(p);
@@ -125,10 +135,14 @@ const char* disk_kind_name(int32_t kind) {
          : kind == kDiskStop ? "kept at a stop or before unloading" : "turn end";
 }
 
-std::string disk_snapshot_key(const std::vector<int32_t>& ids, bool cvec) {
+std::string disk_snapshot_key(const std::vector<int32_t>& ids, bool cvec, const std::vector<ConversationImageKey>& imgs) {
     uint64_t h = fnv(ids.data(), ids.size() * sizeof(int32_t), kFnvBasis);
     const uint8_t c = cvec ? 1 : 0;
     h = fnv(&c, 1, h);
+    for (const ConversationImageKey& k : imgs) {   // (none: a text snapshot's name, as before)
+        h = fnv(&k.start, sizeof k.start, h);
+        h = fnv(&k.hash, sizeof k.hash, h);
+    }
     char k[17];
     std::snprintf(k, sizeof k, "%016llx", (unsigned long long) h);
     return k;
@@ -172,16 +186,26 @@ bool DiskCache::open(const std::string& dir, uint64_t cap_bytes, std::string& er
     return true;
 }
 
-int DiskCache::best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model, uint64_t config,
-                    const std::string& layout, int64_t& resume) const {
-    return best(prompt, cvec, model, [config](uint64_t c, size_t) { return c == config; }, layout, resume);
+int DiskCache::best(const std::vector<int64_t>& prompt, const std::vector<ConversationImageKey>& prompt_imgs, bool cvec,
+                    uint64_t model, uint64_t config, const std::string& layout, int64_t& resume) const {
+    return best(prompt, prompt_imgs, cvec, model, [config](uint64_t c, size_t) { return c == config; }, layout, resume);
 }
 
-int DiskCache::best(const std::vector<int64_t>& prompt, bool cvec, uint64_t model,
-                    const std::function<bool(uint64_t config, size_t tokens)>& config_ok, const std::string& layout,
-                    int64_t& resume) const {
+int DiskCache::best(const std::vector<int64_t>& prompt, const std::vector<ConversationImageKey>& prompt_imgs, bool cvec,
+                    uint64_t model, const std::function<bool(uint64_t config, size_t tokens)>& config_ok,
+                    const std::string& layout, int64_t& resume) const {
     int pick = -1;
     resume = 0;
+    // S-42: the pictures that start below L, the same in both (the tokens below L are already equal)
+    auto same_imgs = [&prompt_imgs](const std::vector<ConversationImageKey>& have, int64_t L) {
+        size_t a = 0, b = 0;
+        for (;; ++a, ++b) {
+            while (a < have.size() && have[a].start >= L) ++a;
+            while (b < prompt_imgs.size() && prompt_imgs[b].start >= L) ++b;
+            if (a == have.size() || b == prompt_imgs.size()) return a == have.size() && b == prompt_imgs.size();
+            if (!(have[a] == prompt_imgs[b])) return false;
+        }
+    };
     for (size_t i = 0; i < e_.size(); ++i) {
         const DiskSnapshot& s = e_[i];
         if (s.cvec != cvec || s.model != model || s.layout != layout || !config_ok(s.config, s.ids.size())) continue;
@@ -190,11 +214,11 @@ int DiskCache::best(const std::vector<int64_t>& prompt, bool cvec, uint64_t mode
         while (lcp < lim && (int64_t) s.ids[lcp] == prompt[lcp]) ++lcp;
         int64_t cand = 0;
         // the last prompt token always starts the first verify window: a snapshot must stop before it
-        if (lcp == s.ids.size() && s.ids.size() < prompt.size()) {
+        if (lcp == s.ids.size() && s.ids.size() < prompt.size() && same_imgs(s.imgs, (int64_t) s.ids.size())) {
             cand = (int64_t) s.ids.size();
         } else {
             for (auto it = s.cks.rbegin(); it != s.cks.rend(); ++it)
-                if (*it <= (int64_t) lcp && *it < (int64_t) prompt.size()) { cand = *it; break; }
+                if (*it <= (int64_t) lcp && *it < (int64_t) prompt.size() && same_imgs(s.imgs, *it)) { cand = *it; break; }
         }
         if (cand <= 0) continue;
         if (cand > resume || (cand == resume && pick >= 0 &&
@@ -206,16 +230,16 @@ int DiskCache::best(const std::vector<int64_t>& prompt, bool cvec, uint64_t mode
     return pick;
 }
 
-int DiskCache::find(const std::vector<int32_t>& ids, bool cvec) const {
+int DiskCache::find(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const {
     for (size_t i = 0; i < e_.size(); ++i)
-        if (e_[i].cvec == cvec && e_[i].ids == ids) return (int) i;
+        if (e_[i].cvec == cvec && e_[i].ids == ids && e_[i].imgs == imgs) return (int) i;
     return -1;
 }
 
 bool DiskCache::write_meta(const DiskSnapshot& s, std::string& err) const {
     Writer w;
     w.raw(kMagic, 8);
-    w.put(kVersion);
+    w.put(s.imgs.empty() ? kVersion : kVersionImages);
     w.put(s.model);
     w.put(s.config);
     w.put((uint32_t) s.layout.size());
@@ -229,6 +253,10 @@ bool DiskCache::write_meta(const DiskSnapshot& s, std::string& err) const {
     w.raw(s.ids.data(), s.ids.size() * 4);
     w.put((uint64_t) s.cks.size());
     w.raw(s.cks.data(), s.cks.size() * 8);
+    if (!s.imgs.empty()) {
+        w.put((uint64_t) s.imgs.size());
+        for (const ConversationImageKey& k : s.imgs) { w.put(k.start); w.put(k.hash); }
+    }
     w.put(fnv(w.buf.data(), w.buf.size(), kFnvBasis));
     const fs::path tmp = u8(path(s.key, "meta.tmp")), dst = u8(path(s.key, "meta"));
     {
