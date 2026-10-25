@@ -2574,7 +2574,12 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
-        self.dir = self.work_dir()
+        # S-42 (fork): the vision section's "cache_dir" keeps the encoded pictures on the drive from one load to the next
+        # (a folder per encoder setting), so a conversation the engine reads back from its disk cache after a reload
+        # does not send its pictures through the encoder again; without it, a temp folder that goes with the server
+        self.persist = self.persist_dir(cfg)
+        self.dir = self.persist or self.work_dir()
+        self.cache_max = int(cfg.get("cache_max") or (256 if self.persist else 64))
         self.spawn = (args, log, env)                   # to start it again after an unload
         # AMD: the GPU reader (strata-vision-hip) has the CPU reader (strata-vision, same program, no GPU runtime) to
         # fall back on when it does not start; _start switches to it by itself
@@ -2584,6 +2589,8 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        if self.persist:
+            self._load_persisted()
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
@@ -2592,6 +2599,59 @@ class Vision:
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
             self._start()
+
+    @staticmethod
+    def persist_dir(cfg: dict) -> Path | None:
+        """S-42: <cache_dir>/enc-<tag>, the tag from what the embeddings depend on (the mmproj file, max/min_tokens);
+        None without "cache_dir", or when it cannot be used (made, or a space in its path: #480)."""
+        root = cfg.get("cache_dir")
+        if not root:
+            return None
+        mm = os.path.abspath(cfg["mmproj"])
+        try:
+            size = os.path.getsize(mm)
+        except OSError:
+            size = -1
+        what = [os.path.basename(mm).lower(), size, cfg.get("max_tokens"), cfg.get("min_tokens")]
+        d = Path(root) / ("enc-" + hashlib.sha256(json.dumps(what).encode()).hexdigest()[:12])
+        why = "a space in its path (#480)" if " " in str(d) else None
+        if why is None:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                why = str(e)
+        if why is not None:
+            print(f"[strata] images: the vision section's cache_dir is not used ({why}); encoded pictures are kept "
+                  "for this run only", flush=True)
+            return None
+        return d
+
+    def _load_persisted(self):
+        """S-42: the pictures encoded at earlier loads, least recently used first (a file's time is its last use).
+        What an ended server left behind (an image being encoded, a request's combined file, a short file) goes."""
+        found = []
+        for p in self.dir.iterdir():
+            try:
+                if p.suffix == ".img" or p.name.startswith("req-"):
+                    p.unlink(missing_ok=True)
+                    continue
+                if p.suffix != ".sve" or len(p.stem) != 32:
+                    continue
+                with open(p, "rb") as f:
+                    hdr = struct.unpack("<5i", f.read(20))
+                st = p.stat()
+                if hdr[0] != 0x31455653 or hdr[1] < 1 or st.st_size != 20 + hdr[1] * hdr[4] * 4:
+                    p.unlink(missing_ok=True)
+                    continue
+                found.append((st.st_mtime, p.stem, p, hdr[1]))
+            except (OSError, struct.error):
+                continue
+        for _, key, p, n in sorted(found):
+            self.cache[key] = (p, n)
+        while len(self.cache) > self.cache_max:
+            self.cache.pop(next(iter(self.cache)))[0].unlink(missing_ok=True)
+        if self.cache:
+            print(f"[strata] images: {len(self.cache)} pictures encoded at earlier loads are kept in {self.dir}", flush=True)
 
     @staticmethod
     def reader_args(cfg: dict) -> list:
@@ -2795,9 +2855,13 @@ class Vision:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             self._ensure_dir()
-            if key in self.cache:
+            if key in self.cache and self.cache[key][0].is_file():
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
+                if self.persist:
+                    with contextlib.suppress(OSError):                 # its time is its last use at the next load
+                        os.utime(self.cache[key][0])
                 return self.cache[key]
+            self.cache.pop(key, None)
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -2816,7 +2880,7 @@ class Vision:
             self.cache[key] = (out, int(line.split()[1]))
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
-                if len(self.cache) <= 64:
+                if len(self.cache) <= self.cache_max:
                     break
                 if str(self.cache[old][0]) not in held:
                     self.cache.pop(old)[0].unlink(missing_ok=True)
@@ -2846,7 +2910,8 @@ class Vision:
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
         /tmp that is RAM) goes with it instead of piling up with every start.  unload() keeps it for the restart."""
         self.close()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if not self.persist:                            # S-42: a cache_dir is kept for the next load
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def gpu_list(cfg: dict) -> list[int]:
