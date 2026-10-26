@@ -73,6 +73,7 @@ from strata_control import user_args  # noqa: E402
 from strata_control import gpu_roles  # noqa: E402
 from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
+from serve.ckpt_ledger import CkptLedger  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
@@ -5841,6 +5842,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
+    # S-50 (fork): link this reply's id to the disk cache snapshot the engine writes for it (serve/ckpt_ledger.py)
+    ledger = getattr(svc, "ckpt_ledger", None) if run is None and req.get("strata_disk") is not False else None
+    if ledger is not None:
+        ledger.begin(cid, ids)
     yield chunk({"role": "assistant", "content": ""})
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
@@ -5857,6 +5862,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield c
         elif kind == "event":
             ev: Event = x
+            if ledger is not None:
+                ledger.first(cid)
             if ev.kind == "reasoning" and ev.text:
                 yield chunk({"reasoning_content": ev.text})
             elif ev.kind == "content" and ev.text:
@@ -5881,6 +5888,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             finish = "tool_calls" if whole and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
+            if ledger is not None:
+                ledger.end(cid, x["completion_tokens"])
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
@@ -8422,6 +8431,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    # S-50 (fork): the engine's --disk-cache folder gets replies.jsonl (which reply each snapshot continues)
+    dc_args = list(cfg.get("args") or []) if a.engine == "strata" else []
+    if "--disk-cache" in dc_args[:-1]:
+        dc_dir = Path(dc_args[dc_args.index("--disk-cache") + 1])
+        if not dc_dir.is_absolute() and cfg.get("cwd"):
+            dc_dir = Path(cfg["cwd"]) / dc_dir
+        svc.ckpt_ledger = CkptLedger(dc_dir, log=lambda m: print(m, flush=True))
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
