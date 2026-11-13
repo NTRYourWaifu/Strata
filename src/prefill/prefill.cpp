@@ -1053,6 +1053,8 @@ struct Prefill::Impl {
         size_t tab_n = 0;
         float* R_host = nullptr;
         size_t R_host_n = 0;
+        float* hand_host = nullptr;          // S-64 (fork): the first PC's final rows of a super-chunk, sent to the other PC
+        size_t hand_host_n = 0;
         int32_t* tab_host = nullptr;
         size_t tab_host_n = 0;
         int32_t* idsw_host = nullptr;
@@ -1140,6 +1142,7 @@ void Prefill::release() {
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     if (impl_->lm.dev) cudaFree(impl_->lm.dev);
     if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
+    if (impl_->lm.hand_host) cudaFreeHost(impl_->lm.hand_host);
     if (impl_->lm.tab_host) cudaFreeHost(impl_->lm.tab_host);
     if (impl_->lm.idsw_host) cudaFreeHost(impl_->lm.idsw_host);
     for (int b = 0; b < 2; ++b)
@@ -5219,7 +5222,16 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     Impl& m = *impl_;
     if (m.g == nullptr) { why = "not initialized"; return 0; }
     const core::ModelGeometry& g = *m.g;
-    if (stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr || hand_in_ != nullptr) { why = "a layer split"; return 0; }
+    // S-64 (fork): a split across two PCs (after upstream's layer split of 2026-10-24, over the link instead of a second
+    // card).  Each PC reads its own layers layer-major: the first one (layers [0, K), remote_) hands a super-chunk's
+    // final rows to the other PC in one prompt message; the second one (hand_in_: that message's rows, layers
+    // [K, n_layers)) reads them in super-chunks of its own size.  A local split's stages have no layer-major form here.
+    const bool lm_whole = stage_lb_ == 0 && stage_le_ == g.n_layers && next_ == nullptr && hand_in_ == nullptr && !remote_;
+    const bool lm_first = stage_lb_ == 0 && stage_le_ < g.n_layers && remote_ && next_ == nullptr && hand_in_ == nullptr;
+    const bool lm_last = stage_lb_ > 0 && stage_le_ == g.n_layers && !remote_ && next_ == nullptr && hand_in_ != nullptr &&
+                         hand_ev_ == nullptr;
+    if (!lm_whole && !lm_first && !lm_last) { why = "a layer split"; return 0; }
+    if (lm_first && (!remote_next || stage_le_ < 2)) { why = "a layer split before the PLE layer"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
     // (S-42, fork: an image prompt too - its picture rows go in at layer 0 as run_impl's do, and the rope kernels read
     // the pictures' positions from the M-RoPE table in either path)
@@ -5230,7 +5242,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     }
     const MmqPlan& mp = mmq_plan();
     if (!mp.any || (int64_t) mp.layer.size() < g.n_layers) { why = "the experts are not on MMQ"; return 0; }
-    for (int64_t l = 0; l < g.n_layers; ++l)
+    for (int64_t l = stage_lb_; l < stage_le_; ++l)
         if (!mp.layer[(size_t) l]) { why = "a layer's experts are not on MMQ"; return 0; }
     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
     if (!m.grp_gu || !m.grp_d || !m.Xq || !m.GU || !m.H || !m.Hq || !m.Dm || !m.ids_identity || !m.tok_dev) {
@@ -5257,7 +5269,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
         while (s >= min_s && (int64_t) dev_bytes(s, r_dev) > room) s -= m.T;
         return s >= min_s ? s : (int64_t) 0;
     };
-    const int mode = lm_r_env();
+    // (the second PC's rows arrive on the host - the message - so they stay there)
+    const int mode = lm_last ? 2 : lm_r_env();
     bool r_dev = false;
     int64_t s_use = 0;
     if (mode == 1) { s_use = fit(true); r_dev = true; }
@@ -5290,6 +5303,11 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
         if (!host_grow(rh, lb.R_host_n, (size_t) s_use * D)) { why = "no pinned RAM for the residual rows"; lb.R_host = nullptr; return 0; }
         lb.R_host = (float*) rh;
     }
+    if (lm_first) {   // S-64: the super-chunk's final rows, read by the sending thread while the next one is computed
+        int32_t* hh = (int32_t*) lb.hand_host;
+        if (!host_grow(hh, lb.hand_host_n, (size_t) s_use * D)) { why = "no pinned RAM for the rows to the other PC"; lb.hand_host = nullptr; return 0; }
+        lb.hand_host = (float*) hh;
+    }
     const uint64_t bytes = dev_bytes(s_use, r_dev);
     void* d = nullptr;
     if (cudaMalloc(&d, bytes) != cudaSuccess) {
@@ -5320,6 +5338,14 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
             }
     lb.r_dev = r_dev;
     lb.S = s_use;
+    if (!lm_whole) {   // S-64: a split across two PCs - what this PC sized
+        size_t free_a = 0, total_a = 0;
+        cudaMemGetInfo(&free_a, &total_a);
+        std::fprintf(stderr, "strata prefill: layer-major on layers %lld..%lld of a split across two PCs: super-chunks of up to "
+                             "%lld tokens (sub-chunks of %lld), %lld MiB of VRAM for them, %lld MiB free after\n",
+                     (long long) stage_lb_, (long long) stage_le_, (long long) s_use, (long long) m.T,
+                     (long long) (bytes >> 20), (long long) (free_a >> 20));
+    }
     return s_use;
 }
 
@@ -5333,6 +5359,19 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     const cudaStream_t cs = (cudaStream_t) m.cs;
     Impl::LmBufs& lb = m.lm;
     const int64_t S = lb.S, L = g.n_layers;
+    // S-64 (fork): this PC's layers [LB, LE) of a split across two PCs (lm_prepare).  The second PC's rows of layer LB
+    // arrive in hand_in_ and are copied into R_host per super-chunk; the first PC's final pass writes its rows into
+    // the hand-off buffer and a thread sends the super-chunk while this one reads its next (one buffer: the final
+    // pass waits until the super-chunk before is sent).
+    const int64_t LB = stage_lb_, LE = stage_le_;
+    const bool to_remote = remote_ && LE < L;
+    auto lm_left = [&err](const char* where) -> bool {   // false: a CUDA call before `where` left an error (named in err)
+        const cudaError_t e = cudaGetLastError();
+        if (e == cudaSuccess) return true;
+        err = std::string("prefill (layer-major): ") + where + ": " + cudaGetErrorString(e);
+        return false;
+    };
+    if (!lm_left("before the run")) return false;
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -5703,18 +5742,33 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         const int64_t nc = (Sn + m.T - 1) / m.T;
         ++lm_supers;
         lm_mid_ = true;
-        for (int64_t l = 0; l <= L; ++l) {
+        if (hand_in_ != nullptr) {   // S-64: the other PC's rows of this super-chunk (the copy stream read the last one's)
+            if (cudaStreamSynchronize(m.copy) != cudaSuccess) {
+                err = std::string("prefill (layer-major): the copy stream: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            std::memcpy(lb.R_host, hand_in_ + (size_t) sc0 * D, (size_t) Sn * D * 4);
+        }
+        if (!lm_left("the super-chunk's start")) return false;
+        for (int64_t l = LB; l <= LE; ++l) {
             const auto ta = Clock::now();
-            if (l < L && !lm_prefetch(l)) return false;
+            if (l < LE && !lm_prefetch(l)) return false;
+            if (!lm_left("the layer's expert prefetch")) return false;
             // host mode: sub-chunk c's rows go up on the copy stream into buffer c % 2 (issued one sub-chunk ahead)
             auto r_buf = [&](int64_t c) { return (c & 1) ? lb.R2 : R_chunk; };
+            bool up_ok = true;
             auto issue_up = [&](int64_t c) {
                 const int64_t cc0 = sc0 + c * m.T, TT = std::min(m.T, n - cc0);
-                cudaMemcpyAsync(r_buf(c), lb.R_host + (size_t) (c * m.T) * D, (size_t) TT * D * 4, cudaMemcpyHostToDevice,
-                                m.copy);
-                cudaEventRecord(lb.ev_in[c & 1], m.copy);
+                if (cudaMemcpyAsync(r_buf(c), lb.R_host + (size_t) (c * m.T) * D, (size_t) TT * D * 4, cudaMemcpyHostToDevice,
+                                    m.copy) != cudaSuccess ||
+                    cudaEventRecord(lb.ev_in[c & 1], m.copy) != cudaSuccess)
+                    up_ok = false;
             };
             if (!lb.r_dev && l > 0) issue_up(0);
+            if (!up_ok || !lm_left("the rows' upload")) {
+                if (err.empty()) err = std::string("prefill (layer-major): the residual rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
             int64_t qsa_index = 0, gdn_index = 0;
             for (int64_t i = 0; i < std::min(l, L); ++i) (core::is_qsa_layer(g, i) ? qsa_index : gdn_index) += 1;
             const int64_t qsa_index0 = qsa_index, gdn_index0 = gdn_index;
@@ -5739,6 +5793,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 m.mixed = lb.mixed + t0 * N;
                 m.inj = lb.inj + t0 * HC;
                 float* const acc = lb.acc + t0 * N;
+                if (!up_ok || !lm_left("a sub-chunk's rows")) {
+                    if (err.empty()) err = std::string("prefill (layer-major): the residual rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
                 if (l == 0) {
                     // ---- embeddings, broadcast to the four streams (run_impl's C-4 batched gather, else per token)
                     pt.mark(kPfStart, cs);
@@ -5805,13 +5863,29 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             return ple_gather(c0, b, ple_next_err);
                         });
                     for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
-                } else {
+                } else if (l > LB) {   // (S-64: the second PC's first layer - the first PC wrote layer LB - 1)
                     // the previous layer's experts: the hyper-connection write of its FFN half
                     gr_write(m.R, acc, m.inj, HC, T, cs);
                     if (strata::kernels::cvec().covers(l - 1))
                         strata::kernels::cvec_apply(m.R, l - 1, T, D, nullptr, 0, nullptr, 0, false, cs);
                 }
-                if (l == L) {
+                if (l == LE && to_remote) {
+                    // ---- S-64: this sub-chunk's rows into the hand-off buffer (on the copy stream, as the per-layer
+                    // download) once the super-chunk before is on its way to the other PC
+                    stats_.tokens += T;
+                    ++stats_.chunks;
+                    if (c == 0 && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                    cudaEventRecord(lb.ev_done[c & 1], cs);
+                    cudaStreamWaitEvent(m.copy, lb.ev_done[c & 1], 0);
+                    if (cudaMemcpyAsync(lb.hand_host + (size_t) t0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost,
+                                        m.copy) != cudaSuccess) {
+                        err = "prefill (layer-major): the hand-off to the other PC failed";
+                        return false;
+                    }
+                    cudaEventRecord(lb.ev_out[c & 1], m.copy);
+                    continue;
+                }
+                if (l == LE) {
                     // ---- the final rows of this sub-chunk: reported in order, as run_impl's chunks are
                     stats_.tokens += T;
                     ++stats_.chunks;
@@ -5905,6 +5979,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     }
                 }
                 bool normed = false;
+                if (c == 0 && !lm_left("the QSA step records")) return false;
                 for (int half = 0; half < 2; ++half) {
                     // ---- the hyper-connection read of this half (run_impl's)
                     const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
@@ -5914,6 +5989,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                           *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                     if (!wn || !wd || !wu || !wi) return false;
                     pt.mark(kPfHc, cs);
+                    if (c == 0 && !lm_left("the hyper-connection weights")) return false;
                     if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, cs, m.xn16_lo);
                     else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, cs, m.xn16_lo);
                     normed = false;
@@ -6155,8 +6231,35 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 }
             }
             ms_attn += ms_since(ta);
-            if (l == L) break;
+            if (l == LE) break;
             if (!lm_experts(l, Sn)) return false;
+        }
+        if (to_remote) {   // S-64: the super-chunk's rows are in the hand-off buffer: a thread sends them
+            if (cudaStreamSynchronize(cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess) {
+                err = std::string("prefill (layer-major): the hand-off to the other PC: ") +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (on_stage_chunk && !on_stage_chunk(pos0 + sc0 + Sn, err)) return false;
+            next_err_.clear();
+            // the other PC gets the super-chunk in messages of one sub-chunk, as the default path sends its chunks (its
+            // buffers, its RAM and its replies stay a chunk's: 2026-11-14 a 3800-token message took ~0.6 GiB of host
+            // memory on each PC, and the other PC's own layer-major read of it was no faster than its chunks).
+            // STRATA_PREFILL_LM_NET_TOKENS: the message's tokens (0: the whole super-chunk in one)
+            static const int64_t net_tokens = [] {
+                const char* e = std::getenv("STRATA_PREFILL_LM_NET_TOKENS");
+                return e ? (int64_t) std::atoll(e) : (int64_t) -1;
+            }();
+            const int64_t piece = net_tokens == 0 ? Sn : net_tokens > 0 ? net_tokens : m.T;
+            next_run_ = std::async(std::launch::async, [this, h = lb.hand_host, tokens, sc0, Sn, pos0, piece] {
+                strata::aux_cpus::pin_current_thread();
+                for (int64_t a = 0; a < Sn; a += piece) {
+                    const int64_t Ta = std::min(piece, Sn - a);
+                    if (!remote_next || !remote_next(h + (size_t) a * D, tokens + sc0 + a, Ta, pos0 + sc0 + a, false, next_err_))
+                        return false;
+                }
+                return true;
+            });
         }
     }
     lm_mid_ = false;
@@ -6175,10 +6278,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     std::fprintf(stderr, "strata prefill: layer-major: %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
                          "%lld expert blobs streamed (%.1f MB), %lld resident, %lld MMQ groups; %.0f ms (host: "
                          "enqueueing the attention halves %.0f, the experts %.0f: waiting for the attention halves "
-                         "%.0f, the routing tables %.0f)\n",
+                         "%.0f, the routing tables %.0f); layers %lld..%lld\n",
                  (long long) n, (long long) lm_supers, (long long) S, lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
                  (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
-                 ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
+                 ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables, (long long) LB, (long long) LE);
     if (pt.on) {
         pt.fold();
         double total = 0.0;
@@ -6257,10 +6360,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (auto* ps = dynamic_cast<core::PairShadowSource*>(impl_->src)) ps->prompt_size(n);
         impl_->src->prompt_begin();
     }
-    if (lm_env() && hand_in_ == nullptr && impl_) {   // S-21 (fork): vizdatom's layer-major prefill
+    // S-21 (fork): vizdatom's layer-major prefill; S-64: also each PC's layers of a split across two PCs
+    if (lm_env() && impl_ && (hand_in_ == nullptr || (stage_lb_ > 0 && next_ == nullptr && !remote_))) {
         std::string why;
         if (lm_prepare(n, why) > 0) {
-            const bool ok = run_layer_major(tokens, n, pos0, err);
+            bool ok = run_layer_major(tokens, n, pos0, err);
+            std::string drain_err;   // S-64: the last super-chunk's send, the other PC's replies still owed
+            if (!drain_pipeline(drain_err) && ok) {
+                ok = false;
+                err = drain_err;
+            }
             lm_mid_ = false;
             lm_release();
             if (impl_->src) impl_->src->prompt_end();

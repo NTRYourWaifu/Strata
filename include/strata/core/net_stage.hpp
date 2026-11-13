@@ -50,6 +50,10 @@ enum class NetOp : uint32_t {
     DiskApply = 13,    ///< the snapshot DiskLoad read becomes this PC's session (its checkpoints too)
     DiskDiscard = 14,  ///< the snapshot DiskLoad read is dropped
     DiskDrop = 15,     ///< int32 n, then n keys of 16 chars: delete those snapshots' files
+    // S-64, the elastic K/V across two PCs (STRATA_KV_GROW=1 + STRATA_S40=1 on both): the first PC says how many cells
+    // the request starting now can reach; the second PC trims / grows its own layers' K/V to that (an older second PC
+    // answers "an unknown message" and the first PC stops sending it)
+    KvRoom = 16,       ///< int64 cells
     Reply = 100,
 };
 
@@ -136,6 +140,8 @@ public:
     bool restore(int64_t L, std::string& err);
     /// The request's control vector switch for the second PC's layers (it answers an error when it has none loaded).
     bool cvec(bool on, std::string& err);
+    /// S-64: the cells the request starting now can reach; the second PC trims / grows its layers' elastic K/V to it.
+    bool kv_room(int64_t cells, std::string& err);
     /// A batched prompt chunk: this PC's rows of layer K go over, the other PC reads its layers; with `back` its last
     /// layer's rows come back (T x row_floats).  Thread: one at a time, while nothing else uses the link.
     bool prefill(const NetPrefillHead& h, const int32_t* tokens, const float* rows, int64_t row_floats,

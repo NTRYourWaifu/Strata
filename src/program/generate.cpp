@@ -254,6 +254,14 @@ bool s40_env() {
     }();
     return on;
 }
+// S-64 fork: STRATA_NET_PIPE_ADAPT=1 (opt-in): --pipeline-windows 2 and --adapt-async together on the first of two PCs
+bool s64_net_pipe_adapt() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NET_PIPE_ADAPT");
+        return v && v[0] != '0';
+    }();
+    return on;
+}
 
 // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
 // A file-backed arena on AMD (STRATA_ARENA_MMAP; the engine raises ROCclr's pin-in-place threshold, see main): an
@@ -3095,7 +3103,7 @@ int main(int argc, char** argv) {
         // (NetPipe).  The second PC is the last stage and only ever runs verified windows: nothing to do there.  With
         // a local split every stage on the first PC is a front stage.
         if (net_second) o.pipeline_windows = 0;
-        o.kv_grow = false;
+        if (!s40_env()) o.kv_grow = false;   // S-64: with STRATA_S40 each PC's K/V is elastic over its own cache
         o.vram_elastic = false;
     }
     int64_t net_exact_slots = -1;   // STRATA_NET_EXACT: this PC's cache takes exactly this many profile pairs
@@ -4350,7 +4358,10 @@ int main(int argc, char** argv) {
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         const char* off = !o.serve ? "it needs --serve"
                         : net_first && o.pipeline_windows < 2 ? "across two PCs only --pipeline-windows 2"
-                        : net_first && o.adapt_async ? "not with --adapt-async across two PCs"
+                        // S-64: STRATA_NET_PIPE_ADAPT=1 lets the asynchronous tier run beside the pipelined loop across
+                        // two PCs as it does on a local two-stage split: this PC has one stage (ahomes.size() == 1, so
+                        // a_pl_idle / a_gap only ever see PV[0]) and the tier never touches the other PC's cache
+                        : net_first && o.adapt_async && !s64_net_pipe_adapt() ? "not with --adapt-async across two PCs"
                         : split_same ? "it needs each stage of the layer split on its own GPU"
                         : !net_first && !multi_gpu ? "it needs a layer split on two GPUs"
                         : !net_first && split_devs.empty() ? "it needs a layer split into two or more stages"
@@ -5314,7 +5325,9 @@ int main(int argc, char** argv) {
             for (const int r : o.expert_cache_remote) remote = remote || r > 0;
             const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_grow;
             // S-40: a RAM budget on one PC keeps it too (the experts given up go to the RAM copy, see kvg_ensure)
-            const bool s40_budget = s40_env() && o.resident_budget > 0 && !net_first && !net_second;
+            // S-64: across two PCs too (each PC's whole resident RAM copy is the same structure as a budget's: the
+            // experts given up take colder ones' RAM places, which read from the file from then on)
+            const bool s40_budget = s40_env() && (o.resident_budget > 0 || net_first || net_second);
             const bool on = asked && !multi_gpu && o.kv_resident <= 0 &&
                             !o.expert_profile.empty() && (!o.resident_cpu_experts || s40_budget) && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
@@ -9490,6 +9503,7 @@ int main(int argc, char** argv) {
         // memory as between two GPUs, and the link carries it to the other PC (the second PC's stage reads it from there)
         std::unique_ptr<strata::core::NetLink> net_link;
         std::unique_ptr<strata::core::NetPipe> net_pp;   // --pipeline-windows across two PCs: the other PC, driven async
+        bool net_kv_room = true;   // S-64: the other PC takes NetOp::KvRoom (cleared when it answers "an unknown message")
         bool net_cvec = true;   // the second PC's control vector switch, as last sent (a loaded vector starts on)
         // with a local layer split the last local stage hands over to the other PC (its stage was set up above)
         strata::core::Verifier& net_ver = net_first && multi_gpu ? stages.back()->ver : ver;
@@ -12353,6 +12367,12 @@ int main(int argc, char** argv) {
                             q_host.assign(q, q + (size_t) h.nq * h.q_stride);
                             ver.set_spec_q(q_host.data(), h.nq);
                         }
+                        // S-64: KvRoom took this request's cells already; a window past them (an older first PC) grows here
+                        if (kvg.on && h.pos0 + h.T + 64 > kvg.cells &&
+                            (!ver.wait_commit(e) || !kvg_ensure(h.pos0 + h.T + 64, adapt_quiesce))) {
+                            strata::core::net_reply_err(nc, "its K/V cannot grow to this window");
+                            break;
+                        }
                         drive.d.layers = 0;
                         drive.d.experts = 0;
                         drive.d.failed = false;
@@ -12479,6 +12499,10 @@ int main(int argc, char** argv) {
                         net_adapt_land(true);   // the swaps in flight land before the prompt path lends any slot
                         if (ajob && !adapt_tick(true))   // --adapt-async: the same, the round in flight drained
                             std::fprintf(stderr, "strata serve: second PC: an adaptive step failed\n");
+                        if (kvg.on && h.pos0 + h.T + 64 > kvg.cells && !kvg_ensure(h.pos0 + h.T + 64, adapt_quiesce)) {   // S-64
+                            strata::core::net_reply_err(nc, "its K/V cannot grow to this prompt chunk");
+                            break;
+                        }
                         if (!net_lend(h.T, e)) { strata::core::net_reply_err(nc, "lending the prompt path its slots: " + e); break; }
                         std::vector<int64_t> t64((size_t) h.T);
                         const int32_t* t32 = (const int32_t*) (msg.data() + sizeof h);
@@ -12528,6 +12552,10 @@ int main(int argc, char** argv) {
                         if (it == net_checks.end()) { strata::core::net_reply_err(nc, "no checkpoint at that length"); break; }
                         if (!ver.wait_commit(e)) { strata::core::net_reply_err(nc, e); break; }
                         pending.clear();
+                        if (kvg.on && !kvg_ensure(L + 256, adapt_quiesce)) {   // S-64: the checkpoint's cells
+                            strata::core::net_reply_err(nc, "its K/V cannot grow to the checkpoint");
+                            break;
+                        }
                         if (!checkpoint_restore(it->second, ss, g) || cudaDeviceSynchronize() != cudaSuccess) {
                             strata::core::net_reply_err(nc, "the checkpoint restore failed");
                             break;
@@ -12626,6 +12654,12 @@ int main(int argc, char** argv) {
                             break;
                         }
                         net_disk_img.reset();
+                        // S-64: the snapshot's K/V is read straight into this GPU: its cells first
+                        if (kvg.on && h.L + 256 > kvg.cells &&
+                            (!ver.wait_commit(e) || !kvg_ensure(h.L + 256, adapt_quiesce))) {
+                            strata::core::net_reply_err(nc, "its K/V cannot grow to the snapshot");
+                            break;
+                        }
                         strata::core::SavedConversation image;
                         size_t bytes = 0;
                         bool touched = false, dropped = false;
@@ -12729,6 +12763,21 @@ int main(int argc, char** argv) {
                         logit_row.resize((size_t) ver.vocab());
                         if (!ver.copy_logits(t, logit_row.data())) { strata::core::net_reply_err(nc, "no logits"); break; }
                         strata::core::net_reply_ok(nc, logit_row.data(), logit_row.size() * 4);
+                        break;
+                    }
+                    case strata::core::NetOp::KvRoom: {   // S-64: the request starting now reaches `cells` cells
+                        int64_t cells = 0;
+                        if (msg.size() >= 8) std::memcpy(&cells, msg.data(), 8);
+                        if (!pending.empty()) { strata::core::net_reply_err(nc, pending); pending.clear(); break; }
+                        if (!ver.wait_commit(e)) { strata::core::net_reply_err(nc, e); break; }
+                        if (kvg.on) {
+                            adapt_quiesce();
+                            if (!kvg_trim(cells, 0) || !kvg_ensure(cells, adapt_quiesce)) {
+                                strata::core::net_reply_err(nc, "its K/V cannot take that many cells");
+                                break;
+                            }
+                        }
+                        strata::core::net_reply_ok(nc, nullptr, 0);
                         break;
                     }
                     case strata::core::NetOp::Bye:
@@ -14145,9 +14194,12 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             auto kv_quiesce = adapt_quiesce;
+            // S-64: across two PCs the cells the answer can reach are taken now, on both PCs (the pipelined loop has a
+            // window in flight on the other PC and cannot stop to grow)
+            const int64_t kv_room = (int64_t) n + 256 + (net_link ? (int64_t) max_new : 0);
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
-                if (!kvg_ensure(n + 256, kv_quiesce)) {
+                if (!kvg_ensure(kv_room, kv_quiesce)) {
                     std::printf("ERR the K/V cannot grow to this prompt: no VRAM is left\n");
                     std::fflush(stdout);
                     return 1;
@@ -14575,10 +14627,23 @@ int main(int argc, char** argv) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
-                if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
+                if (!kvg_trim(kv_room, hold_on ? conversations.longest_tokens() + 256 : 0)) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
+                }
+            }
+            if (net_link && net_kv_room) {   // S-64: the other PC's layers' K/V follows (it trims, then grows, to this)
+                std::string ke;
+                if (!net_link->kv_room(kv_room, ke)) {
+                    if (ke.find("unknown message") == std::string::npos) {
+                        std::printf("ERR split across two PCs: the other PC's K/V: %s\n", ke.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    net_kv_room = false;   // an older second PC: its K/V is the whole context already
+                    std::fprintf(stderr, "strata serve: the other PC does not know the elastic K/V message (S-64): not sent "
+                                         "from here on\n");
                 }
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
@@ -16105,6 +16170,38 @@ int main(int argc, char** argv) {
                 // --adapt-async: the asynchronous tier beside the windows (see adapt_tick).  A stage is idle when neither
                 // of its verifiers has a window in flight (a commit or a snapshot copy waits on nothing of the host's)
                 if (ajob) a_pl_idle = [&](int st) { return !PV[st][0]->in_flight() && !PV[st][1]->in_flight(); };
+                // S-64 (fork): STRATA_RAM_ADAPT=<n> in the pipelined loop of the first of two PCs (the plain loop's rule,
+                // below: up to n experts the windows keep routing to take the RAM places of unrouted ones of their
+                // layer).  Run where stage 0 is idle before a launch and no adaptive round is in flight, so nothing
+                // reads the RAM copy; this PC's layers only.  (2026-11-14: without it a 15 GiB budget read ~4000 blobs
+                // from the file per 900-token answer and never stopped, where one PC alone settles.)
+                static const int pl_ram_n = [] {
+                    const char* e = std::getenv("STRATA_RAM_ADAPT");
+                    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+                }();
+                auto pl_ram_adapt = [&]() {
+                    if (pl_ram_n <= 0 || !net_first || multi_gpu || peer.valid() || remote_opt || o.batch != 0) return;
+                    if (drive.d.usage.empty() || !pending.empty() || !src.complement_ready()) return;
+                    if (ajob && (astate != AState::Idle || !ajob->idle())) return;
+                    if (PV[0][0]->in_flight() || PV[0][1]->in_flight()) return;
+                    constexpr float kRouted = 2.0f, kUnused = 0.5f;
+                    struct RamSwap { float gain; int32_t layer, in, out; };
+                    std::vector<RamSwap> swaps;
+                    for (int64_t l = 0; l < std::min<int64_t>(g.n_layers, o.net_split); ++l) {
+                        const float* u = drive.d.usage.data() + l * g.n_expert;
+                        const int32_t* r = host_res.data() + l * g.n_expert;
+                        int32_t in = -1, out = -1;
+                        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
+                            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
+                            if (src.has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
+                            else if (u[e] >= kRouted && (in < 0 || u[e] > u[in])) in = e;
+                        }
+                        if (in >= 0 && out >= 0 && u[out] < kUnused) swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
+                    }
+                    std::sort(swaps.begin(), swaps.end(), [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
+                    if ((int) swaps.size() > pl_ram_n) swaps.resize((size_t) pl_ram_n);
+                    for (const RamSwap& x : swaps) src.replace_resident(x.layer, x.in, x.out);
+                };
                 double a_poll_ms = 0.0;
                 auto pl_adapt = [&]() -> bool {   // the blocking tier (--adapt-async 0)
                     if (pl_adapt_thr.joinable() && pl_adapt_done.load()) {
@@ -16329,6 +16426,7 @@ int main(int argc, char** argv) {
                     if (A.ready && !A.fl && A.fr < pl_nf && !doomed) {
                         const int st = A.fr;
                         if (st == 0 && A.p + A.T > o.max_context) { ending = true; continue; }
+                        if (st == 0) pl_ram_adapt();     // S-64: STRATA_RAM_ADAPT, once a window, while stage 0 is idle
                         if (ajob && st == 0) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
                         if (!snap_take(st, A.seq)) return die("the GDN snapshot failed");
                         if (!VF(st, A).pl_launch(A.T, A.tok, A.p, err)) return die(err);

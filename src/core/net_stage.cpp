@@ -328,6 +328,11 @@ bool NetLink::cvec(bool on, std::string& err) {
     return reply(err);
 }
 
+bool NetLink::kv_room(int64_t cells, std::string& err) {
+    if (!c_.send_msg(NetOp::KvRoom, &cells, 8)) { err = "net stage: send failed"; return false; }
+    return reply(err);
+}
+
 bool NetLink::prefill(const NetPrefillHead& h, const int32_t* tokens, const float* rows, int64_t row_floats,
                       std::vector<float>* back, std::string& err) {
     return prefill_send(h, tokens, rows, row_floats, err) && prefill_reply(h.T, row_floats, back != nullptr, back, err);
