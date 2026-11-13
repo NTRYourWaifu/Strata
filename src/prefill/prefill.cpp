@@ -10,6 +10,7 @@
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
+#include "strata/core/pair_shadow_source.hpp"   // S-67: the sparse prompt read (prompt_size, hint_pairs)
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
@@ -673,6 +674,13 @@ struct Stager {
     /// A layer's jobs; the previous layer's are finished (finish()).
     void start(std::vector<Job>&& js) {
         if (js.empty()) return;
+        {   // S-67 fork: the source learns the whole layer's pairs before the threads ask one by one
+            core::ExpertSource* hs = nullptr;
+            std::vector<int32_t> hl, he;
+            for (const Job& jb : js)
+                if (jb.from != nullptr) { hs = jb.from; hl.push_back(jb.l); he.push_back(jb.e); }
+            if (auto* ps = dynamic_cast<core::PairShadowSource*>(hs)) ps->hint_pairs(hl.data(), he.data(), hl.size());
+        }
         std::lock_guard<std::mutex> lk(mu);
         jobs = std::move(js);
         if (ready_cap < jobs.size()) {
@@ -6245,7 +6253,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return ok;
     }
 #endif
-    if (impl_ && impl_->src) impl_->src->prompt_begin();   // S-15 fork (PairShadowSource)
+    if (impl_ && impl_->src) {   // S-15 fork (PairShadowSource); S-67: a short prompt reads only its own pairs
+        if (auto* ps = dynamic_cast<core::PairShadowSource*>(impl_->src)) ps->prompt_size(n);
+        impl_->src->prompt_begin();
+    }
     if (lm_env() && hand_in_ == nullptr && impl_) {   // S-21 (fork): vizdatom's layer-major prefill
         std::string why;
         if (lm_prepare(n, why) > 0) {

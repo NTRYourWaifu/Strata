@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -156,9 +157,19 @@ std::unique_ptr<PairShadowSource> PairShadowSource::open(ExpertSource* base, con
     s->arena_ = (uint8_t*) VirtualAlloc(nullptr, (size_t) (s->W_ * (int64_t) s->max_stride_), MEM_RESERVE, PAGE_READWRITE);
     if (!s->arena_) { err = "the SSD window's buffers"; return nullptr; }
     s->win_.assign((size_t) s->W_, Entry{});
+    // S-67: prompts of at most this many tokens read only the pairs they route to (0: always the cycle)
+    if (const char* v = std::getenv("STRATA_S21_SPARSE_MAX")) s->sparse_max_ = std::max<int64_t>(0, std::atoll(v));
+    // (A/B within one load: STRATA_S21_SPARSE_FILE names a file whose number replaces the limit at every prompt)
+    if (const char* v = std::getenv("STRATA_S21_SPARSE_FILE"); v != nullptr && v[0] != '\0') s->sparse_file_ = v;
+    // S-67: a sparse prompt's reads are scattered blobs, not the cycle's run: this many more reads in flight per drive,
+    // taken by workers that serve sparse prompts only (the cycle keeps the reads in flight it was tuned with).  Measured
+    // on C/F/H at 4/4/2 + 4: a 145-token tool result 1.69 -> 1.38 s, 406 tokens 2.03 -> 1.88 s.
+    int extra = s->sparse_max_ > 0 || !s->sparse_file_.empty() ? 4 : 0;
+    if (const char* v = std::getenv("STRATA_S21_SPARSE_THREADS")) extra = std::clamp(std::atoi(v), 0, 32);
     for (size_t d = 0; d < s->drives_.size(); ++d) {
         const int n = threads > 0 ? threads : s->drives_[d]->weight < 2.0 ? 2 : 4;
-        for (int t = 0; t < n; ++t) s->drives_[d]->workers.emplace_back([p = s.get(), d] { p->worker((int) d); });
+        for (int t = 0; t < n + extra; ++t)
+            s->drives_[d]->workers.emplace_back([p = s.get(), d, sp = t >= n] { p->worker((int) d, sp); });
     }
     return s;
 #endif
@@ -182,6 +193,9 @@ void PairShadowSource::prompt_begin() {
 #if defined(_WIN32)
     std::lock_guard<std::mutex> lk(mu_);
     if (active_) return;
+    const int64_t n_tokens = next_tokens_;
+    next_tokens_ = -1;
+    sparse_ = false;
     if (refresh_) {
         rebuild_locked();
         if (P_ == 0) return;   // nothing on the file tier now: every ask is the base's
@@ -190,7 +204,86 @@ void PairShadowSource::prompt_begin() {
     win_.assign((size_t) W_, Entry{});
     lo_ = next_ = 0;
     active_ = true;
+    int64_t smax = sparse_max_;
+    if (!sparse_file_.empty()) {
+        if (FILE* f = std::fopen(sparse_file_.c_str(), "r")) {
+            long long v = 0;
+            if (std::fscanf(f, "%lld", &v) == 1) smax = v;
+            std::fclose(f);
+        }
+    }
+    if (smax > 0 && n_tokens > 0 && n_tokens <= smax) {   // S-67: only the hinted pairs
+        sparse_ = true;
+        sp_slot_.assign((size_t) P_, -1);
+        sp_pending_.clear();
+        st_sparse_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     pump_locked();   // the first chunk's first layer
+#endif
+}
+
+void PairShadowSource::sp_pump_locked() {
+    if (!active_ || !sparse_) return;
+    bool any = false;
+    int64_t scan = 0;
+    while (!sp_pending_.empty()) {
+        while (scan < W_ && win_[(size_t) scan].state != 0) ++scan;
+        if (scan >= W_) break;   // the window is full: the rest wait for slots the asks give back
+        const int64_t p = sp_pending_.front();
+        sp_pending_.pop_front();
+        Entry& en = win_[(size_t) scan];
+        en.s = -1;
+        en.state = 1;
+        en.ok = true;
+        en.p = p;
+        sp_slot_[(size_t) p] = (int32_t) scan;
+        drives_[drive_of_[(size_t) p]]->queue.push_back(-(scan + 1));
+        ++inflight_;
+        ++scan;
+        any = true;
+    }
+    if (any) cv_work_.notify_all();
+}
+
+void PairShadowSource::sp_drop_locked() {
+    // the stager finished the previous layer's jobs before this hint: what is still held was never asked (a skipped job)
+    for (auto& d : drives_) {   // queued, not picked up: never read
+        std::deque<int64_t> keep;
+        for (int64_t s : d->queue) {
+            if (s >= 0) { keep.push_back(s); continue; }
+            Entry& en = win_[(size_t) (-s - 1)];
+            if (en.p >= 0) sp_slot_[(size_t) en.p] = -1;
+            en.state = 0;
+            en.p = -1;
+            --inflight_;
+        }
+        d->queue.swap(keep);
+    }
+    for (Entry& en : win_) {
+        if (en.p < 0) continue;
+        if (en.state == 2) { sp_slot_[(size_t) en.p] = -1; en.state = 0; en.p = -1; }
+        else if (en.state == 1) { sp_slot_[(size_t) en.p] = -1; en.state = 3; }   // the worker frees it when it lands
+    }
+    for (int64_t p : sp_pending_) sp_slot_[(size_t) p] = -1;
+    sp_pending_.clear();
+}
+
+void PairShadowSource::hint_pairs(const int32_t* layers, const int32_t* experts, size_t n) {
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!active_ || !sparse_) return;
+    sp_drop_locked();
+    for (size_t i = 0; i < n; ++i) {
+        if (!mine(layers[i], experts[i])) continue;
+        const int64_t p = idx_of_[(size_t) ((int64_t) layers[i] * E_ + experts[i])];
+        if (sp_slot_[(size_t) p] != -1) continue;
+        sp_slot_[(size_t) p] = -2;
+        sp_pending_.push_back(p);
+    }
+    sp_pump_locked();
+#else
+    (void) layers; (void) experts; (void) n;
 #endif
 }
 
@@ -218,16 +311,19 @@ void PairShadowSource::prompt_end() {
     active_ = false;
     for (auto& d : drives_) {   // not yet picked up: never read
         for (int64_t s : d->queue) {
-            Entry& en = win_[(size_t) (s % W_)];
+            Entry& en = win_[(size_t) (s < 0 ? -s - 1 : s % W_)];   // S-67: a sparse read is -(slot + 1)
             en.state = 0;
             en.s = -1;
+            en.p = -1;
             --inflight_;
         }
         d->queue.clear();
     }
     for (Entry& en : win_)
         if (en.state == 1) en.state = 3;
-        else if (en.state == 2) { en.state = 0; en.s = -1; }
+        else if (en.state == 2) { en.state = 0; en.s = -1; en.p = -1; }
+    sparse_ = false;
+    sp_pending_.clear();
     cv_ready_.wait(lk, [&] { return inflight_ == 0; });
     VirtualFree(arena_, (size_t) (W_ * (int64_t) max_stride_), MEM_DECOMMIT);
     lk.unlock();
@@ -236,7 +332,7 @@ void PairShadowSource::prompt_end() {
 }
 
 void PairShadowSource::pump_locked() {
-    if (!active_) return;
+    if (!active_ || sparse_) return;   // S-67: a sparse prompt queues only its hinted pairs (sp_pump_locked)
     bool any = false;
     while (next_ - lo_ < W_) {
         Entry& en = win_[(size_t) (next_ % W_)];
@@ -261,32 +357,37 @@ void PairShadowSource::advance_locked() {
     pump_locked();
 }
 
-void PairShadowSource::worker(int d) {
+void PairShadowSource::worker(int d, bool sparse_only) {
 #if defined(_WIN32)
     Drive& dr = *drives_[(size_t) d];
     void* h = open_unbuffered(dr.path);
     for (;;) {
-        int64_t s = -1;
+        int64_t s = -1, slot = -1, p = -1;
         {
             std::unique_lock<std::mutex> lk(mu_);
-            cv_work_.wait(lk, [&] { return quit_ || !dr.queue.empty(); });
+            // S-67: the extra workers take a sparse prompt's reads only (its queue holds nothing else)
+            cv_work_.wait(lk, [&] { return quit_ || (!dr.queue.empty() && (!sparse_only || sparse_)); });
             if (quit_) break;
             s = dr.queue.front();
             dr.queue.pop_front();
+            // S-67: -(slot + 1) is a sparse read of the place its slot names; else the cycle's sequence number
+            slot = s < 0 ? -s - 1 : s % W_;
+            p = s < 0 ? win_[(size_t) slot].p : s % P_;
         }
-        const int64_t p = s % P_;
         const uint64_t st = stride_[(size_t) layer_of_[(size_t) p]];
-        uint8_t* dst = arena_ + (size_t) (s % W_) * max_stride_;
+        uint8_t* dst = arena_ + (size_t) slot * max_stride_;
         const bool ok = h != nullptr && read_at(h, off_of_[(size_t) p], dst, st);
         if (ok) dr.bytes.fetch_add(st, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lk(mu_);
-            Entry& en = win_[(size_t) (s % W_)];
+            Entry& en = win_[(size_t) slot];
             --inflight_;
             if (en.state == 3) {   // dropped while it was read: the slot is free now
                 en.state = 0;
                 en.s = -1;
-                advance_locked();
+                en.p = -1;
+                if (sparse_) sp_pump_locked();
+                else advance_locked();
             } else {
                 en.state = 2;
                 en.ok = ok;
@@ -330,6 +431,50 @@ bool PairShadowSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     if (!active_) {   // outside a prompt the window holds no RAM
         lk.unlock();
         return read_direct(p, dst);
+    }
+    if (sparse_) {   // S-67: the hinted pair's own slot
+        auto unpend = [&] {
+            auto it = std::find(sp_pending_.begin(), sp_pending_.end(), p);
+            if (it != sp_pending_.end()) sp_pending_.erase(it);
+        };
+        int32_t sl = sp_slot_[(size_t) p];
+        if (sl < 0) {   // not hinted, dropped, or still waiting for a slot: first in line
+            if (sl == -2) unpend();
+            sp_slot_[(size_t) p] = -2;
+            sp_pending_.push_front(p);
+            sp_pump_locked();
+            sl = sp_slot_[(size_t) p];
+            if (sl < 0) {   // the window is full of other pairs: read this one here
+                unpend();
+                sp_slot_[(size_t) p] = -1;
+                lk.unlock();
+                return read_direct(p, dst);
+            }
+        }
+        while (win_[(size_t) sl].state != 2) {
+            cv_ready_.wait(lk);
+            if (!active_ || !sparse_ || sp_slot_[(size_t) p] != sl) {   // the prompt ended or the slot was dropped
+                lk.unlock();
+                return read_direct(p, dst);
+            }
+        }
+        Entry& en = win_[(size_t) sl];
+        const bool ok = en.ok;
+        const uint8_t* src = arena_ + (size_t) sl * max_stride_;
+        en.state = 4;   // being copied out: no one frees or refills it
+        lk.unlock();
+        if (ok) std::memcpy(dst, src, (size_t) bb_[(size_t) layer]);
+        lk.lock();
+        en.state = 0;
+        en.p = -1;
+        sp_slot_[(size_t) p] = -1;
+        sp_pump_locked();
+        lk.unlock();
+        cv_ready_.notify_all();
+        st_blobs_.fetch_add(1, std::memory_order_relaxed);
+        st_wait_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        return ok || read_direct(p, dst);
     }
     // the sequence number this ask means: the cycle's next occurrence of p at or after the window's start, less the
     // slack an out-of-order ask may trail by
@@ -483,6 +628,7 @@ std::string PairShadowSource::take_stats() {
                                "spot, %lld restarts; drives", (long long) n, (double) tot / 1073741824.0, (double) wus / 1000.0,
                   (long long) dir, (long long) rs);
     std::string s = b;
+    if (st_sparse_.exchange(0) > 0) s = "sparse (S-67): " + s;
     for (size_t i = 0; i < by.size(); ++i) {
         std::snprintf(b, sizeof b, " %c:%.0f%%", drives_[i]->path.empty() ? '?' : drives_[i]->path[0],
                       tot ? 100.0 * (double) by[i] / (double) tot : 0.0);

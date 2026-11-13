@@ -46,6 +46,14 @@ public:
     /// only a few hundred MiB free on a squeezed PC).
     void prompt_begin() override;
     void prompt_end() override;
+    /// S-67 (fork): a prompt of at most STRATA_S21_SPARSE_MAX tokens does not run the cycle (every file-tier pair, ~22 GiB
+    /// on UD-IQ2_XS at 14.97 GiB of RAM, read in order whatever the prompt routes to - ~2.3 s on three drives for a
+    /// 200-token tool result).  It reads only the pairs the stager's jobs name (hint_pairs, one layer at a time), all of
+    /// them queued to their drives at once, into the same window slots.  Same bytes.
+    /// (called by the prompt path through a dynamic_cast, so the ExpertSource interface - and every file that includes
+    /// it - stays as it was)
+    void prompt_size(int64_t n_tokens) { std::lock_guard<std::mutex> lk(mu_); next_tokens_ = n_tokens; }
+    void hint_pairs(const int32_t* layers, const int32_t* experts, size_t n);
     /// One line: blobs read, GiB, the prompt path's waits on the window, the drives' shares (and resets the counters).
     std::string take_stats();
 
@@ -97,6 +105,7 @@ private:
         int64_t s = -1;                     // window sequence number held (-1: none)
         int state = 0;                      // 0 free, 1 reading, 2 ready, 3 dropped while reading, 4 being copied out
         bool ok = true;
+        int64_t p = -1;                     // S-67 sparse mode: the place (pair) this slot holds
     };
     bool mine(int64_t layer, int64_t expert) const {
         return layer >= 0 && layer < L_ && expert >= 0 && expert < E_ && idx_of_[(size_t) (layer * E_ + expert)] >= 0;
@@ -107,7 +116,7 @@ private:
     bool read_direct(int64_t p, uint8_t* dst);   // out of the window, synchronous
     void pump_locked();                     // issue reads while the window has room
     void advance_locked();                  // lo_ past the consumed / dropped entries
-    void worker(int d);
+    void worker(int d, bool sparse_only);
 
     void rebuild_locked();                  // S-21: the cycle from all_ and refresh_
     struct Listed { int32_t l, e; uint8_t d; uint64_t off; };
@@ -130,6 +139,16 @@ private:
     int64_t inflight_ = 0;
     bool active_ = false;
     bool quit_ = false;
+    // S-67 sparse mode (a short prompt): queue entries are -(slot + 1); sp_slot_ per place: -1 none, -2 pending, else slot
+    void sp_pump_locked();                  // give pending places free slots and queue their reads
+    void sp_drop_locked();                  // the previous layer's hints nobody took (skipped jobs): free their slots
+    int64_t next_tokens_ = -1;
+    int64_t sparse_max_ = 0;
+    std::string sparse_file_;
+    bool sparse_ = false;
+    std::vector<int32_t> sp_slot_;
+    std::deque<int64_t> sp_pending_;
+    std::atomic<int64_t> st_sparse_{0};
     std::mutex mu_;
     std::condition_variable cv_work_, cv_ready_;
     std::atomic<int64_t> st_blobs_{0}, st_direct_{0}, st_resets_{0};
