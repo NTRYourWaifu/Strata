@@ -218,6 +218,23 @@ LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-w
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
 LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
 LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
+# S-78 (fork, opt-in "reasoning_language": "zh"; a request's own "reasoning_language" wins, "off" turns it off): the
+# thinking is steered to Chinese.  Measured 2026-11-14 on two PCs: Chinese thinking decodes ~20% faster than English
+# (50-53 against 43 tok/s), and the user reads it without a translation pass.  Two steps: the thinking opens with a
+# short Chinese lead written for the model (it goes on from it); the next ZH_CHECK_TOKENS reasoning tokens are held
+# back, and if they are English the pass is dropped unseen and the thinking restarts once behind a firmer lead.
+ZH_THINK_LEAD = "好的，我用繁體中文來想。"
+ZH_THINK_RETRY = "\n（改用繁體中文思考，不寫英文。）首先，"
+ZH_CHECK_TOKENS = 48
+_ZH_CJK = re.compile(r"[㐀-鿿]")
+_ZH_LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
+
+
+def reasoning_is_english(text):
+    """The held-back start of the thinking reads as English: more Latin words than CJK characters (code identifiers
+    inside Chinese sentences stay below that), and enough of them to judge."""
+    latin = len(_ZH_LATIN_WORD.findall(text))
+    return latin >= 8 and len(_ZH_CJK.findall(text)) < latin
 
 
 def reasoning_repeat_coverage(text):
@@ -3776,6 +3793,8 @@ class Service:
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.reasoning_language = None                # S-78 (opt-in "zh"): the thinking is steered to Chinese
+        self.reasoning_language_file = None           # ... and its live switch: a file whose first character 0 = off
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -5082,6 +5101,17 @@ class Service:
             if ka is not None:
                 ka.release()
 
+    def reasoning_language_now(self):
+        """S-78: the config's reasoning_language, unless the switch file (reasoning_language_file: read for every
+        request, so it is a live switch that needs no reload) starts with 0.  No file, or one unreadable = on."""
+        if self.reasoning_language and self.reasoning_language_file:
+            try:
+                if Path(self.reasoning_language_file).read_text(encoding="ascii", errors="replace").strip()[:1] == "0":
+                    return None
+            except OSError:
+                pass
+        return self.reasoning_language
+
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
@@ -5255,7 +5285,35 @@ class Service:
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     for ev in opening:
                         yield "event", ev
+                    # S-78: the thinking steered to Chinese (ZH_THINK_LEAD above).  Not for a request with pictures,
+                    # nor one whose cap leaves no room for the lead.
+                    zh_want = (sampling or {}).get("reasoning_language") or self.reasoning_language_now()
+                    zh_on = bool(thinking and zh_want == "zh" and not emb and parser.state == "reasoning"
+                                 and max_new - n >= 64)
+                    zh_hold, zh_buf, zh_text, zh_tokens = zh_on, [], "", 0
+                    zh_redo, zh_retried, zh_snap, n_lead = False, False, None, 0
+
+                    def zh_inject(text):
+                        """`text` written into the thinking for the model: counted and parsed like its own tokens."""
+                        nonlocal n, thinking_n, thought
+                        ids2, out2 = self.tok.encode(text), []
+                        for t2 in ids2:
+                            n += 1
+                            raw_ids.append(t2)
+                            thinking_n += parser.state in ("reasoning", "rcall")
+                            thought += 1
+                            ev2 = cut(parser.feed(detok.push(t2)))
+                            self._note(n, ev2, st, rate)
+                            out2.extend(ev2)
+                        return ids2, out2
+                    if zh_on:
+                        lead_ids, lead_evs = zh_inject(ZH_THINK_LEAD)
+                        for ev in lead_evs:
+                            yield "event", ev
+                        prompt, n_lead = prompt + lead_ids, n
                     while True:
+                        # (S-78: what a dropped pass is rolled back to)
+                        zh_snap = (n, thinking_n, thought, len(raw_ids), len(reasoning_text), run_tok, run_len) if zh_hold else None
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
@@ -5307,6 +5365,23 @@ class Service:
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
+                                if zh_hold:
+                                    # S-78: the start of the thinking is held back until it is known to be Chinese
+                                    zh_buf.extend(evs)
+                                    zh_tokens += 1
+                                    zh_text += "".join(ev.text or "" for ev in evs if ev.kind == "reasoning")
+                                    if parser.state != "reasoning" or any(ev.kind != "reasoning" for ev in evs):
+                                        zh_hold = False         # the thinking is over already: nothing to judge
+                                    elif (zh_tokens >= ZH_CHECK_TOKENS and not parser.buf and not parser.pending
+                                          and not detok.pending()):
+                                        zh_hold = False
+                                        if not zh_retried and reasoning_is_english(zh_text) and max_new - n > 64:
+                                            zh_redo = True
+                                            break
+                                    if zh_hold:
+                                        evs = []
+                                    else:
+                                        evs, zh_buf = zh_buf, []
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
@@ -5376,17 +5451,46 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if zh_redo and zh_snap is not None and not cancel.is_set() and not nonfinite:
+                            # S-78: the held start of the thinking was English.  None of it was sent: the pass is
+                            # rolled back and the thinking starts again behind a firmer lead (once)
+                            zh_redo, zh_retried, zh_hold = False, True, False
+                            dropped = n - zh_snap[0]
+                            n, thinking_n, thought = zh_snap[0], zh_snap[1], zh_snap[2]
+                            del raw_ids[zh_snap[3]:]
+                            reasoning_text = reasoning_text[:zh_snap[4]]
+                            run_tok, run_len = zh_snap[5], zh_snap[6]
+                            zh_buf, zh_text, zh_tokens = [], "", 0
+                            retry_ids, retry_evs = zh_inject(ZH_THINK_RETRY)
+                            for ev in retry_evs:
+                                yield "event", ev
+                            prompt = prompt + retry_ids
+                            print(f"[strata] the thinking started in English: {dropped} tokens dropped unseen, "
+                                  "starting it again in Chinese (reasoning_language)", flush=True)
+                            if trace is not None:
+                                trace["reasoning_language_retries"] = 1
+                            continue
+                        zh_redo = False
+                        if zh_buf:                          # the pass ended with its start still held: it goes out as it is
+                            zh_hold = False
+                            for ev in zh_buf:
+                                if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                    reasoning_text += ev.text or ""
+                                if ev.kind in ("content", "tool_start", "tool_call"):
+                                    answered = True
+                                yield "event", ev
+                            zh_buf = []
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
-                            if n == 0 and not nf_retried:
+                            if n == n_lead and not nf_retried:
                                 nf_retried = True
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
                                 del segments[segments_before:]
                                 print("[strata] the engine's logits became non-finite before the first token (#879); it "
                                       "dropped its cached state: sending the request again once", flush=True)
                                 continue
-                            if n == 0:
+                            if n == n_lead:
                                 finish = "error"
                                 print("[strata] the engine's logits became non-finite again on the retry (#879): the "
                                       "request ends with an error", flush=True)
@@ -8458,6 +8562,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.reasoning_language = "zh" if cfg.get("reasoning_language") == "zh" else None   # S-78: opt-in, off by default
+    svc.reasoning_language_file = cfg.get("reasoning_language_file") or None
+    if svc.reasoning_language:
+        print("[strata] thinking is steered to Chinese (reasoning_language: zh in the config; a request's "
+              "\"reasoning_language\": \"off\" turns it off for that request)", flush=True)
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
