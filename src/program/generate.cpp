@@ -12272,10 +12272,81 @@ int main(int argc, char** argv) {
                 int64_t net_run_n = 0;
                 double net_t_wait = ver.ms_wait, net_t_pool = ver.ms_pool, net_t_run = drive.d.ms_run;   // at the last Zero
                 int64_t net_t_miss = drive.d.multi_misses, net_t_ent = drive.d.multi_entries, net_t_hits = drive.d.cache_hits;
+                // S-64 read-ahead: while a prompt chunk is worked on, a reader thread takes the next message off the wire.
+                // A prompt chunk is ~170 MB (8192 tokens, bf16): read only after the chunk before it was answered, the
+                // GPU idles for the whole transfer (1.6-2.4 s a chunk measured).  Only behind a prompt chunk: a
+                // window's message is read by this thread as before (through the reader every window paid ~2 ms for the
+                // hand-over).  STRATA_NET_READAHEAD=0: never.
+                static const bool net_ahead = [] { const char* v = std::getenv("STRATA_NET_READAHEAD"); return !(v && v[0] == '0'); }();
+                struct NetAhead {
+                    std::mutex mu;
+                    std::condition_variable cv;
+                    bool go = false, have = false, quit = false;
+                    strata::core::NetOp op{};
+                    std::vector<uint8_t> msg;   // swapped with the loop's buffer: no 170 MB allocation a chunk
+                    bool ok = false;
+                    std::string err;
+                    double at = 0;   // when its last byte was read
+                } rd;
+                bool rd_pending = false;   // the reader holds (or is reading) the next message
+                std::thread rd_thr;
+                if (net_ahead)
+                    rd_thr = std::thread([&] {
+                        for (;;) {
+                            {
+                                std::unique_lock<std::mutex> lk(rd.mu);
+                                rd.cv.wait(lk, [&] { return rd.go || rd.quit; });
+                                if (rd.quit) return;
+                                rd.go = false;
+                            }
+                            rd.ok = nc.recv_msg(rd.op, rd.msg, rd.err);
+                            rd.at = (double) strata::core::progress_now_ms() / 1000.0;
+                            {
+                                std::lock_guard<std::mutex> lk(rd.mu);
+                                rd.have = true;
+                            }
+                            rd.cv.notify_all();
+                        }
+                    });
+                struct RdJoin {   // the loop below never leaves with a read in flight: the reader waits on the flag
+                    NetAhead& r;
+                    std::thread& t;
+                    ~RdJoin() {
+                        if (!t.joinable()) return;
+                        { std::lock_guard<std::mutex> lk(r.mu); r.quit = true; }
+                        r.cv.notify_all();
+                        t.join();
+                    }
+                } rd_join{rd, rd_thr};
                 while (!bye) {
                     strata::core::NetOp op{};
                     std::string e;
-                    if (!nc.recv_msg(op, msg, e)) {
+                    double net_at = 0;
+                    bool got;
+                    if (rd_pending) {
+                        std::unique_lock<std::mutex> lk(rd.mu);
+                        rd.cv.wait(lk, [&] { return rd.have; });
+                        rd.have = false;
+                        rd_pending = false;
+                        op = rd.op;
+                        msg.swap(rd.msg);
+                        got = rd.ok;
+                        e = rd.err;
+                        net_at = rd.at;
+                    } else {
+                        got = nc.recv_msg(op, msg, e);
+                    }
+                    if (got && op != strata::core::NetOp::Prefill && pf_in.capacity() + pf_back.capacity() > (size_t) (16u << 20)) {
+                        // S-64: the prompt is over; its row buffers (~670 MB after a long one) do not stay through the decode
+                        std::vector<float>().swap(pf_in);
+                        std::vector<float>().swap(pf_back);
+                    }
+                    if (got && net_ahead && op == strata::core::NetOp::Prefill) {   // the next one comes in behind this chunk
+                        { std::lock_guard<std::mutex> lk(rd.mu); rd.go = true; }
+                        rd.cv.notify_all();
+                        rd_pending = true;
+                    }
+                    if (!got) {
                         std::fprintf(stderr, "strata serve: split across two PCs: %s; waiting for the next connection\n",
                                      e.c_str());
                         break;
@@ -12284,8 +12355,8 @@ int main(int argc, char** argv) {
                     // STRATA_NET_TRACE=1 logs each one as it arrives
                     static const bool net_trace = [] { const char* v = std::getenv("STRATA_NET_TRACE"); return v && v[0] == '1'; }();
                     if (net_trace)
-                        std::fprintf(stderr, "net: %.3f op %d, %zu bytes\n", (double) strata::core::progress_now_ms() / 1000.0,
-                                     (int) op, msg.size());
+                        std::fprintf(stderr, "net: %.3f op %d, %zu bytes (read by %.3f)\n",
+                                     (double) strata::core::progress_now_ms() / 1000.0, (int) op, msg.size(), net_at);
                     strata::core::progress().busy.store(true);
                     strata::core::progress_beat();
                     const auto net_t0 = std::chrono::steady_clock::now();
@@ -12516,6 +12587,9 @@ int main(int argc, char** argv) {
                             pf_in.resize((size_t) h.T * D);
                             strata::core::net_from_bf16((const uint16_t*) pf_rows, pf_in.data(), pf_in.size());
                             pf_rows = (const uint8_t*) pf_in.data();
+                            // S-64: the message is spent (tokens copied, rows converted); its ~170 MB go back before the
+                            // chunk runs, the read-ahead's next message takes their place
+                            if (msg.capacity() > (size_t) (32u << 20)) std::vector<uint8_t>().swap(msg);
                         }
                         sp.set_hand_in((const float*) pf_rows, h.single_chunk != 0);
                         if (!sp.run(t64.data(), h.T, h.pos0, e)) {

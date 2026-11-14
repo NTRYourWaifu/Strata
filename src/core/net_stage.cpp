@@ -170,6 +170,14 @@ bool NetConn::send_msg(NetOp op, const void* a, size_t na, const void* b, size_t
     // one buffer, one send: the window's message leaves in as few segments as the stack makes of it
     thread_local std::vector<uint8_t> out;
     const MsgHead h{kMagic, (uint32_t) op, (uint64_t) (na + nb + nc + nd + ne)};
+    if (na + nb + nc + nd + ne > (size_t) (16u << 20)) {
+        // S-64: a prompt chunk's rows (~170 MB) go out part by part: one buffer of them would stay allocated in
+        // this thread for good, on a second PC that has no RAM to spare
+        if (!send_all(&h, sizeof h)) return false;
+        for (auto [p, n] : {std::pair<const void*, size_t>{a, na}, {b, nb}, {c, nc}, {d, nd}, {e, ne}})
+            if (n > 0 && !send_all(p, n)) return false;
+        return true;
+    }
     out.resize(sizeof h + na + nb + nc + nd + ne);
     uint8_t* w = out.data();
     std::memcpy(w, &h, sizeof h);

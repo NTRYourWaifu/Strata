@@ -5737,8 +5737,23 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         cudaStream_t stream;
         ~LmKvDrain() { if (stream) cudaStreamSynchronize(stream); }
     } lm_kv_drain{lm_rkv ? m.kv_copy : nullptr};
-    for (int64_t sc0 = 0; sc0 < n; sc0 += S) {
-        const int64_t Sn = std::min(S, n - sc0);
+    // S-64 (opt-in, measured 11-14: no gain): the first PC of a split can read a shorter super-chunk first, so the
+    // other PC starts earlier (it idles until the first one's final rows arrive, 5 s for 8192 tokens through 32
+    // layers).  STRATA_PREFILL_LM_FIRST=N: a first super-chunk of N tokens; =-1: the remainder first instead of last.
+    // With the remainder first the other PC started 2.6 s earlier on 20K tokens, and the request took as long: the
+    // last super-chunk is then a full one, and its rows' way back to the draft layer (1 Gbps) took what was won.
+    int64_t S_first = S;
+    if (to_remote) {
+        static const int64_t first_env = [] { const char* e = std::getenv("STRATA_PREFILL_LM_FIRST"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+        const int64_t floor_s = std::min<int64_t>(S, 4 * m.T);
+        int64_t f = S;
+        if (first_env > 0) f = first_env;
+        else if (first_env < 0 && n > S) f = n % S == 0 ? S : n % S;
+        f = std::max(floor_s, std::min(S, (f + m.T - 1) / m.T * m.T));
+        if (f < n) S_first = f;
+    }
+    for (int64_t sc0 = 0, Sc = S_first; sc0 < n; sc0 += Sc, Sc = S) {
+        const int64_t Sn = std::min(Sc, n - sc0);
         const int64_t nc = (Sn + m.T - 1) / m.T;
         ++lm_supers;
         lm_mid_ = true;
