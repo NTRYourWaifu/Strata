@@ -4985,9 +4985,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             if (remote_) {   // the other PC reads its layers of this chunk while this one reads the next
-                next_run_ = std::async(std::launch::async, [this, h, tokens, c0, T, p0, single_chunk] {
+                const int nflags = (single_chunk ? 1 : 0) | (c0 + T >= n ? 2 : 0);   // S-74: 2 = the run's last chunk
+                next_run_ = std::async(std::launch::async, [this, h, tokens, c0, T, p0, nflags] {
                     strata::aux_cpus::pin_current_thread();
-                    return remote_next && remote_next(h, tokens + c0, T, p0, single_chunk, next_err_);
+                    return remote_next && remote_next(h, tokens + c0, T, p0, nflags, next_err_);
                 });
             } else {
                 next_->hand_in_ = h;
@@ -6266,11 +6267,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 return e ? (int64_t) std::atoll(e) : (int64_t) -1;
             }();
             const int64_t piece = net_tokens == 0 ? Sn : net_tokens > 0 ? net_tokens : m.T;
-            next_run_ = std::async(std::launch::async, [this, h = lb.hand_host, tokens, sc0, Sn, pos0, piece] {
+            next_run_ = std::async(std::launch::async, [this, h = lb.hand_host, tokens, sc0, Sn, pos0, piece, n] {
                 strata::aux_cpus::pin_current_thread();
                 for (int64_t a = 0; a < Sn; a += piece) {
                     const int64_t Ta = std::min(piece, Sn - a);
-                    if (!remote_next || !remote_next(h + (size_t) a * D, tokens + sc0 + a, Ta, pos0 + sc0 + a, false, next_err_))
+                    const int nflags = sc0 + a + Ta >= n ? 2 : 0;   // S-74: the run's last message
+                    if (!remote_next || !remote_next(h + (size_t) a * D, tokens + sc0 + a, Ta, pos0 + sc0 + a, nflags, next_err_))
                         return false;
                 }
                 return true;

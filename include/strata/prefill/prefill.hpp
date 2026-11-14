@@ -231,7 +231,9 @@ public:
     void set_stage_remote(int64_t layer_begin, int64_t layer_end) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = nullptr; remote_ = true;
     }
-    std::function<bool(const float* rows, const int64_t* tokens, int64_t T, int64_t pos0, bool single_chunk,
+    /// `flags`: 1 = the run is this one chunk; 2 = S-74 (fork): this is the last chunk of the run (the other PC may
+    /// give the prompt path's loan back as soon as it has read it, instead of when its next message arrives).
+    std::function<bool(const float* rows, const int64_t* tokens, int64_t T, int64_t pos0, int flags,
                        std::string& err)> remote_next;
     /// S-9 (fork): a `remote_next` that sends its chunk without waiting for the other PC's reply leaves replies owed;
     /// this reads them all (in order) when the run ends, as drain_pipeline waits for a local next stage.  Null:

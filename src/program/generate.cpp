@@ -9502,6 +9502,7 @@ int main(int argc, char** argv) {
         // ---- a split across two PCs (net_stage.hpp): this PC's verifier runs its layers; the hand-off is mapped pinned
         // memory as between two GPUs, and the link carries it to the other PC (the second PC's stage reads it from there)
         std::unique_ptr<strata::core::NetLink> net_link;
+        std::atomic<bool> net_pf_last_part{false};   // S-74: the prompt part being read is the last batched one (see remote_next)
         std::unique_ptr<strata::core::NetPipe> net_pp;   // --pipeline-windows across two PCs: the other PC, driven async
         bool net_kv_room = true;   // S-64: the other PC takes NetOp::KvRoom (cleared when it answers "an unknown message")
         bool net_cvec = true;   // the second PC's control vector switch, as last sent (a loaded vector starts on)
@@ -9603,14 +9604,19 @@ int main(int argc, char** argv) {
                         }
                         return true;
                     };
-                    net_sp.remote_next = [link, pf_R_d, D, net_dev, owed, pf_depth, pf_recv, pf_report](
-                                             const float* rows, const int64_t* toks, int64_t T, int64_t p0, bool single,
+                    net_sp.remote_next = [link, pf_R_d, D, net_dev, owed, pf_depth, pf_recv, pf_report, &net_pf_last_part](
+                                             const float* rows, const int64_t* toks, int64_t T, int64_t p0, int flags,
                                              std::string& e) -> bool {
                         const strata::core::OnDevice on_d(net_dev);   // called on a prompt-path thread
                         strata::core::NetPrefillHead h;
                         h.pos0 = p0;
                         h.T = (int32_t) T;
-                        h.single_chunk = single ? 1 : 0;
+                        h.single_chunk = (flags & 1) != 0 ? 1 : 0;
+                        // S-74 (fork): the last chunk of the prompt's last batched part: the other PC refills the slots
+                        // its prompt path borrowed right after it, while this PC takes the rows back and runs its draft
+                        // layer, instead of at its next message (the checkpoint or the first window then waited for it:
+                        // 2026-11-14, 1.3 s after a 3800-token part, 0.1-0.4 s after a few hundred tokens)
+                        h.pad = (flags & 2) != 0 && net_pf_last_part.load(std::memory_order_relaxed) ? 1 : 0;
                         h.ple_prev[0] = p0 >= 2 ? (int32_t) toks[-2] : -1;   // `toks` points into the whole prompt
                         h.ple_prev[1] = p0 >= 1 ? (int32_t) toks[-1] : -1;
                         h.want_R = pf_R_d != nullptr ? 1 : 0;
@@ -12604,6 +12610,16 @@ int main(int argc, char** argv) {
                         }
                         ++net_pf_n;
                         net_pf_tokens += h.T;
+                        // S-74 (fork): the first PC says this was the prompt's last chunk: the loan goes back now, not
+                        // when the next message arrives (STRATA_NET_REFILL_EARLY=0: as before)
+                        static const bool refill_early = [] { const char* v = std::getenv("STRATA_NET_REFILL_EARLY"); return !(v && v[0] == '0'); }();
+                        if (refill_early && (h.pad & 1) != 0 && !pf_parts.empty() && !pf_parts[0].lent.empty()) {
+                            std::string re;
+                            if (!net_refill(re)) {
+                                std::fprintf(stderr, "strata serve: second PC: refilling the lent slots failed: %s\n", re.c_str());
+                                pending = "refilling the lent slots failed: " + re;
+                            }
+                        }
                         break;
                     }
                     case strata::core::NetOp::Cvec: {
@@ -15852,10 +15868,17 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            int64_t last_batched_to = -1;   // S-74: the end of the prompt's last part that goes through the prompt path
+            for (int64_t a2 = at; const int64_t to : cuts) {
+                if (to <= a2) continue;
+                if (!windows_ok(a2, to)) last_batched_to = to;
+                a2 = to;
+            }
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
+                net_pf_last_part.store(!win && to == last_batched_to, std::memory_order_relaxed);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
