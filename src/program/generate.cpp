@@ -7933,6 +7933,8 @@ int main(int argc, char** argv) {
     // send their experts to the RAM copy and the slots handed back are refilled from it - see kvg_ensure / kvg_trim
     bool kvg_budget = false;
     int64_t kvg_adopted = 0, kvg_backfilled = 0;
+    int64_t kvg_lent = 0;   // S-58: chunks released to the driver for another program (the VRAM command), not back yet
+    int64_t kvg_lend_free0 = 0;   // S-58: free VRAM (bytes) just before the first of those chunks left: taking them back keeps it
     std::vector<uint8_t> kvg_bounce;   // one expert's bytes on their way from its slot to the RAM copy
     // S-40 check (STRATA_S40_VERIFY=1): the slots and the RAM places a growth or a trim wrote hold the files' bytes
     static const bool kvg_check = [] { const char* v = std::getenv("STRATA_S40_VERIFY"); return v && v[0] != '0'; }();
@@ -7988,10 +7990,15 @@ int main(int argc, char** argv) {
     };
     // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
     // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
-    auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
-        if (!kvg.on || cells <= kvg.cells) return true;
-        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
-        const int64_t need = strata::core::qsa_kv_elastic_need(target);
+    // S-58 (fork): `lend_chunks` > 0 - not a growth: that many chunks leave the cache the same way and are released
+    // to the driver, for another program (the image encoder) to take; the VRAM command maps new ones back (kvg_trim's
+    // give_only).  While they are out the cache is that much smaller, as after a growth of the K/V.
+    auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce, int64_t lend_chunks = 0) -> bool {
+        if (!kvg.on) return lend_chunks <= 0;
+        if (lend_chunks <= 0 && cells <= kvg.cells) return true;
+        const int64_t target = lend_chunks > 0 ? kvg.cells
+                                               : std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        const int64_t need = lend_chunks > 0 ? lend_chunks : strata::core::qsa_kv_elastic_need(target);
         if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
         quiesce();
         strata::core::VmmRange& r = *xcache.vmm_range();
@@ -8110,6 +8117,27 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata: the residency table upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
+        if (lend_chunks > 0) {   // S-58: the chunks go back to the driver instead of to the K/V
+            int64_t out = 0;
+            for (; out < need && !kvg.spare.empty(); ++out) {
+                strata::core::vmm_chunk_free(kvg.spare.back());
+                kvg.spare.pop_back();
+            }
+            kvg_lent += out;
+            std::fprintf(stderr, "strata: S-58: %lld chunks (%lld MiB) of the expert cache released for another program; "
+                                 "the cache gave %lld slots, %lld hotter experts moved to colder ones' slots (%lld of %lld "
+                                 "slots hold experts)\n", (long long) out, (long long) ((uint64_t) out * G >> 20),
+                         (long long) gave, (long long) moved, (long long) (kvg.lo + (xcache.slots() - kvg.top)),
+                         (long long) xcache.slots());
+            if (kvg_budget && gave > 0) {
+                kvg_adopted += adopted;
+                std::fprintf(stderr, "strata: S-40: %lld of those experts took colder ones' places in the RAM copy (%.1f ms)\n",
+                             (long long) adopted,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_adopt0).count());
+                kvg_verify(chk_slots, chk_places, "lend");
+            }
+            return out > 0;
+        }
         int64_t fresh = 0;
         const bool ok = strata::core::qsa_kv_elastic_grow(target, [&]() -> strata::core::VmmChunk {
             if (kvg.spare.empty()) { ++fresh; return 0; }   // the cache is at its floor: new memory
@@ -8140,16 +8168,22 @@ int main(int argc, char** argv) {
     };
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
     // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
-    auto kvg_trim = [&](int64_t cells, int64_t hold) -> bool {   // `hold`: the cells a parked conversation could need
+    // S-58 (fork): `give_only` - the K/V keeps its cells; the chunks in kvg.spare (new ones the VRAM command made for
+    // the ones kvg_ensure's lend released) are mapped back and their slots refilled.
+    auto kvg_trim = [&](int64_t cells, int64_t hold, bool give_only = false) -> bool {   // `hold`: the cells a parked conversation could need
         if (!kvg.on) return true;
-        // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
-        // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
-        // longest parked conversation's cells while it is parked
-        const int64_t want = std::max<int64_t>(cells, hold);
-        const int64_t target = std::max<int64_t>(kvg.step, (want + kvg.step - 1) / kvg.step * kvg.step);
-        if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
-        strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
-        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        if (give_only) {
+            if (kvg.spare.empty() || kvg.lo >= kvg.top) return true;
+        } else {
+            // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
+            // size is grown again (its experts shuffled again) after every short request in between: the K/V keeps the
+            // longest parked conversation's cells while it is parked
+            const int64_t want = std::max<int64_t>(cells, hold);
+            const int64_t target = std::max<int64_t>(kvg.step, (want + kvg.step - 1) / kvg.step * kvg.step);
+            if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
+            strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
+            kvg.cells = strata::core::qsa_kv_elastic_cells();
+        }
         strata::core::VmmRange& r = *xcache.vmm_range();
         const uint64_t G = strata::core::vmm_granularity();
         const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
@@ -9503,6 +9537,19 @@ int main(int argc, char** argv) {
         // memory as between two GPUs, and the link carries it to the other PC (the second PC's stage reads it from there)
         std::unique_ptr<strata::core::NetLink> net_link;
         std::atomic<bool> net_pf_last_part{false};   // S-74: the prompt part being read is the last batched one (see remote_next)
+        // S-81 (fork): the other PC's rows read at the run's end (remote_drain) reach the draft layer through E-9
+        // (Prefill::draft_kv) instead of the drafter's own pass: this PC's prompt path is done then (its streams
+        // synchronized, its scratch region free and still lent), and the own pass is a graph launch per --mtp-max-t rows
+        // (4: ~950 launches, 1.3 s, for a 3800-token part - after the other PC has ended, so all of it is latency).
+        // The replies read while the prompt is still being read (remote_next, on its sending thread) keep the own
+        // pass.  The drafts' K/V come from MMQ rather than mmvq: drafts may differ, the target's tokens never.
+        // Measured 2026-11-16 on the 3080 Ti + 4060L pair (the timing line below): the own pass 619 ms for 3800 rows and
+        // 682 ms for 11900, batched 49 and 229 ms; whole reads 3.9K tokens 9.4 -> 9.0 s, 60K 38.5 -> 38.1 s (the rest
+        // within the noise).  Drafts accepted on the same 3.8K-token greedy question 114/139 batched, 152/192 own pass;
+        // one of four greedy answers parted at a near tie (other drafts group the verify windows differently, so the
+        // target's numbers differ in the last bits).  Default on; STRATA_NET_MTP_BATCH=0: the own pass.
+        bool net_pf_drain = false;
+        static const bool net_mtp_batch = [] { const char* v = std::getenv("STRATA_NET_MTP_BATCH"); return !(v && v[0] == '0'); }();
         std::unique_ptr<strata::core::NetPipe> net_pp;   // --pipeline-windows across two PCs: the other PC, driven async
         bool net_kv_room = true;   // S-64: the other PC takes NetOp::KvRoom (cleared when it answers "an unknown message")
         bool net_cvec = true;   // the second PC's control vector switch, as last sent (a loaded vector starts on)
@@ -9632,16 +9679,36 @@ int main(int argc, char** argv) {
                         if (pf_depth == 1) return pf_recv(e) && pf_report(e);   // send-and-wait
                         return true;
                     };
-                    net_sp.remote_drain = [owed, pf_recv, pf_report](std::string& e) -> bool {
+                    net_sp.remote_drain = [owed, pf_recv, pf_report, &net_pf_drain](std::string& e) -> bool {
                         bool ok = true;
-                        while (!owed->sent.empty()) {   // every reply is read, even after an error: the link stays in step
+                        struct Draining {   // S-81: on_chunk may take the batched pass for these replies
+                            bool& f;
+                            explicit Draining(bool& x) : f(x) { f = net_mtp_batch; }
+                            ~Draining() { f = false; }
+                        } draining(net_pf_drain);
+                        // (said for a part of 1024 rows or more: how long the other PC was waited for, and what the
+                        // draft layer then took - the second is this PC's own latency after the other PC has ended)
+                        double recv_ms = 0, report_ms = 0;
+                        int64_t rows = 0;
+                        while (!owed->sent.empty()) {
                             std::string e2;
-                            if (!pf_recv(e2) || (ok && !pf_report(e2))) {
+                            const auto ta = Clock::now();
+                            const bool got = pf_recv(e2);
+                            const auto tb = Clock::now();
+                            const bool rep = got && ok && pf_report(e2);
+                            recv_ms += std::chrono::duration<double, std::milli>(tb - ta).count();
+                            report_ms += std::chrono::duration<double, std::milli>(Clock::now() - tb).count();
+                            rows += owed->T;
+                            if (!got || (ok && !rep)) {
                                 if (ok) e = e2;
                                 ok = false;
                             }
                         }
-                        return ok;
+                        if (rows >= 1024)
+                            std::fprintf(stderr, "strata serve: split across two PCs: the replies read at the run's end: %lld "
+                                                 "rows, the other PC waited for %.0f ms, the draft layer's K/V %.0f ms (%s)\n",
+                                         (long long) rows, recv_ms, report_ms, net_mtp_batch ? "batched" : "its own pass");
+                        return ok;   // (every reply is read, even after an error: the link stays in step)
                     };
                 }
                 std::fprintf(stderr, "strata serve: split across two PCs: layers 0-%lld here, %lld-%lld on %s (vocab %lld)\n",
@@ -10744,10 +10811,20 @@ int main(int argc, char** argv) {
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
                 use_mtp, multi_gpu, split_mtp_batch && !mtp_first, strata::core::native_embed() != nullptr);
-            if (!net_link && (dkv.try_batched || dkv.why != nullptr)) {   // two PCs: the drafter's own pass
+            // two PCs: the drafter's own pass, but for the replies read at the run's end (S-81, net_pf_drain)
+            if ((!net_link || net_pf_drain) && (dkv.try_batched || dkv.why != nullptr)) {
                 strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
                 const char* why = dkv.why;
                 if (dkv.try_batched) batched = dsp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e, &why);
+                if (net_link) {   // S-81: once per process, what the first reply read at a run's end took
+                    static bool net_said = false;
+                    if (!net_said && e.empty()) {
+                        net_said = true;
+                        std::fprintf(stderr, "strata serve: split across two PCs: the draft layer's prompt K/V for the rows read "
+                                             "at a run's end: %s%s (S-81; STRATA_NET_MTP_BATCH=0: the drafter's own pass)\n",
+                                     batched ? "batched (E-9)" : "the drafter's own pass: ", batched ? "" : (why ? why : "?"));
+                    }
+                }
                 if (multi_gpu) {   // once per process: what this env did
                     static bool said = false;
                     if (!said && (batched || (e.empty() && why != nullptr))) {
@@ -12966,8 +13043,63 @@ int main(int argc, char** argv) {
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+            if (!xcache.segmented() && kvg.on) {
+                // S-58 (fork): with the elastic K/V (--kv-grow) the cache is not in --vram-elastic's segments, but it
+                // gives chunks up and takes them back the K/V's way (kvg_ensure / kvg_trim).  The command lends as
+                // many as `reserve` MiB of free VRAM need (released to the driver: another program - the image
+                // encoder - takes them), or, when more than that is free, makes new ones for those out and refills
+                // their slots.  The experts that leave take RAM places or are read from the files, as after a growth.
+                for (const PfPart& p : pf_parts)
+                    if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
+                if (!ver.wait_commit(e)) return false;
+                adapt_quiesce();
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                const auto t0 = Clock::now();
+                const int64_t G = (int64_t) strata::core::vmm_granularity();
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                // (`VRAM` alone: everything back - the start's reserve also covers what the engine itself took since)
+                const int64_t want_free = bare ? 0 : (int64_t) reserve << 20, lent0 = kvg_lent;
+                const int64_t held0 = kvg.lo + (xcache.slots() - kvg.top);
+                const char* note = "";
+                if ((int64_t) free_b < want_free) {
+                    if (kvg_lent == 0) kvg_lend_free0 = (int64_t) free_b;
+                    if (!kvg_ensure(0, [] {}, (want_free - (int64_t) free_b + G - 1) / G))
+                        note = " (the cache is at its floor: nothing more to give)";
+                } else if (kvg_lent > 0) {
+                    // never below the free VRAM the engine had before it lent (whatever else took VRAM since keeps it)
+                    const int64_t keep = std::max<int64_t>(want_free, kvg_lend_free0);
+                    const int64_t n = std::max<int64_t>(0, std::min<int64_t>(kvg_lent, ((int64_t) free_b - keep) / G));
+                    int64_t got = 0;
+                    for (; got < n; ++got) {
+                        const strata::core::VmmChunk h = strata::core::vmm_chunk_new();
+                        if (h == 0) break;
+                        kvg.spare.push_back(h);
+                    }
+                    kvg_lent -= got;
+                    if (kvg_lent > 0) note = " (not that much VRAM free yet: the rest stay out until the next VRAM)";
+                    if (got > 0 && !kvg_trim(0, 0, true)) { e = "VRAM: taking the cache's chunks back failed"; return false; }
+                }
+                cudaMemGetInfo(&free_b, &total_b);
+                const int64_t held = kvg.lo + (xcache.slots() - kvg.top);
+                const int64_t cache_mib = (int64_t) ((uint64_t) xcache.vmm_range()->mapped_count() * (uint64_t) G >> 20);
+                std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free (S-58, elastic K/V): %lld -> %lld chunks out, "
+                                     "%lld -> %lld of %lld slots hold experts, %lld MiB free now, in %.0f ms%s\n", reserve,
+                             (long long) lent0, (long long) kvg_lent, (long long) held0, (long long) held,
+                             (long long) xcache.slots(), (long long) (free_b >> 20),
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note);
+                std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                            "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve, (long long) held,
+                            (long long) xcache.slots(), (long long) cache_mib,
+                            (long long) (cache_mib + (kvg_lent * G >> 20)), (long long) (free_b >> 20),
+                            (long long) o.prefill_chunk);
+                return true;
+            }
             if (!xcache.segmented()) {
-                e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
+                e = "VRAM needs an engine started with --vram-elastic or the elastic K/V (one NVIDIA GPU, --serve)";
                 return false;
             }
             if (src.complement_ready()) {

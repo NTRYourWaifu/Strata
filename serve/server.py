@@ -2617,6 +2617,10 @@ class Vision:
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         self.gpu = bool(cfg.get("gpu"))                 # 11-03 (fork): a CPU encoder asks the expert cache for no VRAM
+        # S-58 (fork): "elastic_now": the encoder stops right after the pictures of a turn are encoded (still in that
+        # turn, before the engine reads the prompt) and the expert cache takes its VRAM back at once, instead of
+        # keeping it for elastic_idle_s; and a turn whose pictures are all cached does not start the encoder at all.
+        self.elastic_now = cfg.get("elastic_now") is True
         if not lazy and not self.elastic:
             self._start()
 
@@ -2856,6 +2860,16 @@ class Vision:
         out = io.BytesIO()
         im.save(out, format="PNG")
         return out.getvalue()
+
+    def cached(self, source) -> bool:
+        """S-58 (fork): encode() would answer this picture from the cache (the encoder is not needed for it)."""
+        try:
+            data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+        except ValueError:
+            return False
+        key = hashlib.sha256(data).hexdigest()[:32]
+        with self.lock:
+            return key in self.cache and self.cache[key][0].is_file()
 
     def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
@@ -3603,6 +3617,11 @@ def vision_env(cfg: dict, env: dict, archs: dict[int, str] | None = None) -> dic
     dev = (cfg.get("vision") or {}).get("cuda_device")
     if dev is None and cfg.get("backend") == "hip":
         dev = vision_card_off_igpu(env, archs)
+    extra = (cfg.get("vision") or {}).get("env")
+    if isinstance(extra, dict) and extra:
+        # S-58 (fork): the vision section's own "env" (e.g. TEMP off a C: drive busy paging: the encoder writes its
+        # text model's header copy there at every start - tools/vision/gguf_meta.h)
+        env = dict(env, **{str(k): str(v) for k, v in extra.items()})
     if dev is None:
         return env
     env = dict(env)
@@ -4181,9 +4200,33 @@ class Service:
         finally:
             self.fifo.release()
 
+    def _vision_release_now(self):
+        """S-58 (fork), "elastic_now": the encoder stops as soon as the turn's pictures are encoded and the expert cache
+        takes its VRAM back before the engine reads the prompt (the caller holds self.fifo)."""
+        v = self.vision
+        if not (self.vision_held or v.alive()):
+            return
+        t0 = time.time()
+        try:
+            v.unload()
+            if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+                time.sleep(0.2)                           # the driver's counter shows the encoder's release a moment later
+                out = self.engine.vram(self._engine_reserve())
+                print(f"[strata] images: the image encoder stopped after the turn's pictures; the expert cache took its "
+                      f"VRAM back ({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB) in "
+                      f"{time.time() - t0:.1f} s", flush=True)
+        except ValueError as e:
+            print(f"[strata] images: the expert cache did not take its VRAM back ({e})", flush=True)
+        finally:
+            self.vision_held = False
+
     def start_vision_idle(self):
         v = self.vision
         if not getattr(v, "elastic", False):
+            return
+        if getattr(v, "elastic_now", False):             # S-58: stopped in the image turn itself, no idle watcher
+            print("[strata] images: the image encoder starts for a turn's new pictures and stops right after them; while "
+                  f"it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
             return
         print(f"[strata] images: the image encoder starts with the first picture and stops after {v.elastic_idle_s:g} s "
               f"without one; while it runs the expert cache keeps {v.elastic_mib} MiB free for it", flush=True)
@@ -4905,12 +4948,16 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                self._vision_up()
+                now = getattr(self.vision, "elastic", False) and getattr(self.vision, "elastic_now", False)
+                if not (now and all(self.vision.cached(src) for src in images)):   # S-58: all cached: no encoder
+                    self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                                else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
+                    if now:
+                        self._vision_release_now()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -8469,7 +8516,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             print(line, flush=True)
         if cfg.get("vision"):
             # 11-03 (fork): a CPU encoder ("gpu" off) takes no VRAM, so its "elastic" needs no vram_elastic
-            elastic = cfg["vision"].get("elastic") is True and (cfg.get("vram_elastic") is True or not cfg["vision"].get("gpu"))
+            # S-58 (fork): or with the elastic K/V ("elastic_kvg": the engine's VRAM command lends cache chunks)
+            elastic = cfg["vision"].get("elastic") is True and (cfg.get("vram_elastic") is True or not cfg["vision"].get("gpu")
+                                                                or cfg["vision"].get("elastic_kvg") is True)
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -8479,7 +8528,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     for k, v in cfg["vision"].items() if not (k == "exe" and engine_component.is_reference(v))}
             if engine_component.is_reference(cfg["vision"].get("exe")):     # the engine from the component folder
                 vcfg["exe"] = _component_exe(cfg["vision"]["exe"], cfg)
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True and vcfg.get("gpu"):
+            if (vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True and vcfg.get("gpu")
+                    and vcfg.get("elastic_kvg") is not True):
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
