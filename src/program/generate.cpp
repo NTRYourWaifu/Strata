@@ -11401,6 +11401,12 @@ int main(int argc, char** argv) {
         std::atomic<bool> a_err{false};
         double a_pick_ms = 0;             // the arena's inline choice, summed (the stats line)
         size_t a_lo = 0, a_hi = 0, a_bi = 0;   // the batch being copied in (a_copy_in), and where the next one starts
+        // S-82 (upstream 40849df0a, PR #4844): a round planned on the pipelined loop whose loop drained before step 3 takes
+        // step 3 on the serial rule; the range then still named an earlier round's batch.  The pipelined plan now names the
+        // whole round.  The counters say how often that happened and what the stale range would have done (the stats line).
+        bool a_planned_pl = false;
+        size_t s82_lo = 0, s82_hi = 0;          // the range as it was before the fix (a shadow, for the counters only)
+        int64_t s82_cross = 0, s82_lost = 0, s82_stale = 0;
         std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
         std::unique_ptr<JobThread> ajob;
         // the arena mode (srcp == &arena_src): every expert is in the arena already, so a round is a copy in only - no
@@ -11669,11 +11675,19 @@ int main(int argc, char** argv) {
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
+                        // S-82: the whole round is one batch (when the loop drains before step 3, the next tick takes
+                        // step 3 on the serial rule and marks [a_lo, a_hi))
+                        a_lo = 0;
+                        a_hi = a_bi = aswaps.size();
+                        a_planned_pl = true;
                         ajob->post(a_stage_in);
                     } else {
                         res_upload();
                         a_lo = a_hi = a_bi = 0;
                         a_post_batch();
+                        a_planned_pl = false;
+                        s82_lo = a_lo;
+                        s82_hi = a_hi;
                     }
                     astate = AState::SwapIn;
                     if (!drain) return true;
@@ -11683,6 +11697,18 @@ int main(int argc, char** argv) {
                     if (a_due(a_in_due)) return true;   // (pipelined) a card not seen idle since step 2
                     if (!a_ready(drain || a_wait)) return true;
                     if (a_err.load()) return false;
+                    if (!pl && a_planned_pl) {   // S-82: what the range of before the fix would have marked here
+                        ++s82_cross;
+                        const size_t n = aswaps.size(), lo = std::min(s82_lo, n), hi = std::min(s82_hi, n);
+                        s82_stale += (int64_t) (s82_hi > n ? s82_hi - std::max(s82_lo, n) : 0);   // entries past the round's end read as swaps
+                        if (s82_hi < n) {   // (bi == hi) the old code then posted [bi, n) again and marked it: only [0, lo) was lost
+                            s82_lost += (int64_t) lo;
+                            s82_lo = s82_hi;
+                            s82_hi = n;
+                        } else
+                            s82_lost += (int64_t) (n - (hi - lo));   // swaps of this round left unmarked
+                        a_planned_pl = false;
+                    }
                     for (size_t i = pl ? 0 : a_lo; i < (pl ? aswaps.size() : a_hi); ++i) {   // (the batch just landed)
                         const ASwap& w = aswaps[i];
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
@@ -17437,6 +17463,10 @@ int main(int argc, char** argv) {
                                  (int) a_wait, a_inline ? "inline" : "on the job", a_rounds > 0 ? a_pick_ms / (double) a_rounds : 0.0);
                 else
                     std::fprintf(stderr, "\n");
+                if (s82_cross > 0)   // cumulative
+                    std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds finished after the pipelined loop "
+                                         "drained (S-82); the range of before the fix: %lld swaps left unmarked, %lld stale "
+                                         "entries marked\n", (long long) s82_cross, (long long) s82_lost, (long long) s82_stale);
             }
             if (src.exchange_rotation())
                 std::fprintf(stderr, "strata serve: exchange rotation: %llu blocks, %llu host memcpy bytes avoided (cumulative payload)\n",
