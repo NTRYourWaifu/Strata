@@ -74,6 +74,7 @@ from strata_control import gpu_roles  # noqa: E402
 from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve.ckpt_ledger import CkptLedger  # noqa: E402
+from serve.emitted_reuse import EmittedReuse  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import lifeline  # noqa: E402
@@ -4877,6 +4878,12 @@ class Service:
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
+        # S-84 (fork): the stretch a kept conversation spells in other ids takes that conversation's ids - the same
+        # text, so the engine goes on from the conversation it holds instead of reading the last reply again
+        # ("strata_reuse_emitted": false in a request: not for this one)
+        emitted = getattr(self, "emitted", None)
+        if emitted is not None and not images and (req or {}).get("strata_reuse_emitted") is not False:
+            ids = emitted.resync(ids)
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
@@ -5318,6 +5325,8 @@ class Service:
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        if not emb and getattr(self, "emitted", None) is not None:
+                            gen = self.emitted.track(prompt, gen)   # S-84: the ids of this pass are kept
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -8544,6 +8553,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if not dc_dir.is_absolute() and cfg.get("cwd"):
             dc_dir = Path(cfg["cwd"]) / dc_dir
         svc.ckpt_ledger = CkptLedger(dc_dir, log=lambda m: print(m, flush=True))
+    # S-84 (fork): a continuation is tokenized the way the model wrote it (serve/emitted_reuse.py; it also reads the ids
+    # of the disk cache's snapshots).  "reuse_emitted_tokens": false in the config turns it off.
+    svc.emitted = None
+    if a.engine == "strata" and hasattr(svc.tok, "token_bytes") and \
+            cfg.get("reuse_emitted_tokens") is not False:
+        svc.emitted = EmittedReuse(svc.tok, disk_dir=dc_dir if "--disk-cache" in dc_args[:-1] else None,
+                                   log=lambda m: print(m, flush=True))
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
