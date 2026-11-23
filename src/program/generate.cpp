@@ -1986,7 +1986,10 @@ int main(int argc, char** argv) {
     if (net_first || net_second) {
         const char* why = net_first && net_second ? "--net-connect and --net-listen exclude each other"
                         : o.net_split < 2 ? "--net-split K (the second PC's first layer, 2 or more) is needed"
-                        : !o.layer_split.empty() ? "not with --layer-split (one GPU per PC for now)"
+                        : net_second && !o.layer_split.empty() ? "the second PC runs one GPU (--layer-split is the first PC's)"
+                        : split_auto ? "--layer-split auto is not across two PCs: give the split points (e.g. 6)"
+                        : split_same ? "--split-device 0 is not across two PCs"
+                        : multi_gpu && split_at.back() >= o.net_split ? "every --layer-split point must be below --net-split"
                         : !o.resident_cpu_experts ? "it needs the resident RAM mode (--resident-experts): each PC keeps "
                                                     "its own layers' experts in RAM"
                         : o.expert_profile.empty() ? "it needs --expert-profile" : nullptr;
@@ -3070,7 +3073,7 @@ int main(int argc, char** argv) {
         // the split search (see late_weights), so `auto` can trim them too.
         if (!late_weights) {
             const int64_t lb = stage_trim ? split_at[i] : 0;
-            const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : 0;
+            const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : net_hi >= 0 ? net_hi : g.n_layers) : 0;
             if (!load_stage_weights(st, lb, le, stage_trim)) return 1;
         }
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
@@ -3740,7 +3743,8 @@ int main(int argc, char** argv) {
         profile.swap(mine);
         for (size_t i = 0; i < stages.size(); ++i) {
             stages[i]->lb = split_at[i];
-            stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
+            // two PCs: the last local stage ends at --net-split (the rest is the other PC's)
+            stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : net_hi >= 0 ? net_hi : g.n_layers;
         }
     }
 
@@ -6454,7 +6458,10 @@ int main(int argc, char** argv) {
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
-                st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+                if (net_first && i + 1 == stages.size())   // two PCs: the last local stage's chunks go to the other PC
+                    st.sp.set_stage_remote(st.lb, st.le);
+                else
+                    st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
                 const strata::core::OnDevice on(st.dev);
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
@@ -6470,7 +6477,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-            if (net_first) sp.set_stage_remote(0, o.net_split);        // the later layers' chunks go to the other PC
+            if (net_first && !multi_gpu) sp.set_stage_remote(0, o.net_split);   // the later layers' chunks go to the other PC
             if (net_second) sp.set_stage(o.net_split, -1, nullptr);    // it reads the other PC's rows of layer K
             // the pool is idle while a prompt is read unless batch slots decode between its parts
             if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);
@@ -6668,6 +6675,20 @@ int main(int argc, char** argv) {
                 v->set_always_publish(true);
             }
         }
+        // a split across two PCs: the hand-off to the other PC (mapped pinned memory, as between two GPUs; the link
+        // sends it).  Made before the local stages, the last of which writes it when there is a local split.
+        float* net_hand_h = nullptr;
+        float* net_hand_d = nullptr;
+        if (net_first || net_second) {
+            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            if (cudaHostAlloc((void**) &net_hand_h, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &net_hand_d, net_hand_h, 0) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: the hand-off allocation failed\n");
+                return 1;
+            }
+            std::memset(net_hand_h, 0, hb);
+        }
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -6684,9 +6705,13 @@ int main(int argc, char** argv) {
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
-                stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
-                                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
-                split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                // two PCs: the last local stage runs to --net-split and writes the hand-off the link sends
+                const bool to_net = net_first && st + 1 == n_stages;
+                stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1],
+                                        st + 1 < n_stages ? split_at[(size_t) st] : to_net ? o.net_split : -1,
+                                        st == 0 ? nullptr : hand[(size_t) st - 1],
+                                        st + 1 < n_stages ? hand[(size_t) st] : to_net ? net_hand_d : nullptr);
+                split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : to_net ? o.net_split : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
@@ -6771,19 +6796,14 @@ int main(int argc, char** argv) {
         // memory as between two GPUs, and the link carries it to the other PC (the second PC's stage reads it from there)
         std::unique_ptr<strata::core::NetLink> net_link;
         bool net_cvec = true;   // the second PC's control vector switch, as last sent (a loaded vector starts on)
-        float* net_hand_h = nullptr;
-        float* net_hand_d = nullptr;
+        // with a local layer split the last local stage hands over to the other PC (its stage was set up above)
+        strata::core::Verifier& net_ver = net_first && multi_gpu ? stages.back()->ver : ver;
+        const int net_dev = net_first && multi_gpu ? stages.back()->dev : -1;
         if (net_first || net_second) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
-                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            if (cudaHostAlloc((void**) &net_hand_h, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                cudaHostGetDevicePointer((void**) &net_hand_d, net_hand_h, 0) != cudaSuccess) {
-                std::fprintf(stderr, "strata serve: the hand-off allocation failed\n");
-                return 1;
-            }
-            std::memset(net_hand_h, 0, hb);
-            if (net_first) {
+            if (net_first && !multi_gpu) {
                 ver.set_stage(0, o.net_split, nullptr, net_hand_d);
+            }
+            if (net_first) {
                 net_link = std::make_unique<strata::core::NetLink>();
                 strata::core::NetHello h;
                 h.split = (int32_t) o.net_split;
@@ -6799,6 +6819,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 float* net_R_d = nullptr;   // the draft layer's rows: the last layer's residuals, sent back
+                const strata::core::OnDevice on_net(net_dev);   // the drafter's device (a local split: the last stage's)
                 if (!o.mtp.empty()) {
                     const size_t rb = (size_t) strata::kernels::kVerifyMaxT * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
                     if (cudaMalloc((void**) &net_R_d, rb) != cudaSuccess) {
@@ -6808,7 +6829,7 @@ int main(int argc, char** argv) {
                     net_link->R_dev = net_R_d;
                     net_link->R_floats = (int) (g.hc * g.n_embd);
                 }
-                ver.set_link(net_link.get(), net_hand_h, net_R_d);
+                net_ver.set_link(net_link.get(), net_hand_h, net_R_d);
                 {
                     const int64_t D = g.hc * g.n_embd;
                     constexpr int64_t kPfRows = 256;   // the rows that come back reach the draft layer in pieces of this many
@@ -6818,8 +6839,12 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     strata::core::NetLink* link = net_link.get();
-                    sp.remote_next = [&sp, link, pf_R_d, D](const float* rows, const int64_t* toks, int64_t T, int64_t p0,
-                                                            bool single, std::string& e) -> bool {
+                    // a local split: the last local stage's prompt path hands its chunks over (and reports them: the
+                    // drafter is on its device, on_chunk moves there below)
+                    strata::prefill::Prefill& net_sp = multi_gpu ? stages.back()->sp : sp;
+                    net_sp.remote_next = [&net_sp, link, pf_R_d, D, net_dev](const float* rows, const int64_t* toks, int64_t T,
+                                                                             int64_t p0, bool single, std::string& e) -> bool {
+                        const strata::core::OnDevice on_d(net_dev);   // called on a prompt-path thread
                         strata::core::NetPrefillHead h;
                         h.pos0 = p0;
                         h.T = (int32_t) T;
@@ -6831,7 +6856,7 @@ int main(int argc, char** argv) {
                         for (int64_t i = 0; i < T; ++i) t32[(size_t) i] = (int32_t) toks[i];
                         std::vector<float> back;
                         if (!link->prefill(h, t32.data(), rows, D, h.want_R ? &back : nullptr, e)) return false;
-                        if (!sp.on_chunk) return true;
+                        if (!net_sp.on_chunk) return true;
                         for (int64_t a = 0; a < T; a += kPfRows) {
                             const int64_t n = std::min(kPfRows, T - a);
                             if (pf_R_d != nullptr &&
@@ -6840,7 +6865,7 @@ int main(int argc, char** argv) {
                                 e = "the prompt chunk's rows to the draft layer";
                                 return false;
                             }
-                            if (!sp.on_chunk(pf_R_d, n, p0 + a, e)) return false;
+                            if (!net_sp.on_chunk(pf_R_d, n, p0 + a, e)) return false;
                         }
                         return true;
                     };
